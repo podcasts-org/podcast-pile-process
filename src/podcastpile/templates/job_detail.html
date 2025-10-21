@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job #{{ job.id }} - Podcast Pile</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@alenaksu/json-viewer@2.0.0/dist/json-viewer.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            background: #2c3e50;
+            color: white;
+            padding: 20px 0;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        header h1 {
+            font-size: 28px;
+            font-weight: 600;
+        }
+
+        .nav-link {
+            color: #3498db;
+            text-decoration: none;
+            display: inline-block;
+            margin-bottom: 20px;
+        }
+
+        .nav-link:hover {
+            text-decoration: underline;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .card h2 {
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-size: 20px;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 200px 1fr;
+            gap: 15px;
+            margin-bottom: 15px;
+        }
+
+        .info-label {
+            font-weight: 600;
+            color: #666;
+        }
+
+        .info-value {
+            color: #333;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .status-pending { background: #fff3cd; color: #856404; }
+        .status-assigned { background: #d1ecf1; color: #0c5460; }
+        .status-processing { background: #cce5ff; color: #004085; }
+        .status-completed { background: #d4edda; color: #155724; }
+        .status-failed { background: #f8d7da; color: #721c24; }
+        .status-expired { background: #e2e3e5; color: #383d41; }
+
+        .url-text {
+            word-break: break-all;
+            color: #3498db;
+        }
+
+        .json-viewer-container {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            max-height: 600px;
+            overflow: auto;
+        }
+
+        .no-data {
+            color: #999;
+            font-style: italic;
+        }
+
+        json-viewer {
+            --font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            --font-size: 14px;
+            --line-height: 1.5;
+        }
+
+        .text-result {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            padding: 15px;
+            font-family: monospace;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 400px;
+            overflow: auto;
+        }
+
+        .retry-button {
+            background: #f39c12;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 15px;
+        }
+
+        .retry-button:hover {
+            background: #e67e22;
+        }
+
+        .retry-button:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+
+        .message {
+            padding: 10px 15px;
+            border-radius: 4px;
+            margin-top: 15px;
+        }
+
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Job #{{ job.id }}</h1>
+        </div>
+    </header>
+
+    <div class="container">
+        <a href="/jobs" class="nav-link">&larr; Back to All Jobs</a>
+
+        <div class="card">
+            <h2>Job Information</h2>
+            <div class="info-grid">
+                <div class="info-label">ID:</div>
+                <div class="info-value">#{{ job.id }}</div>
+
+                <div class="info-label">Status:</div>
+                <div class="info-value">
+                    <span class="status-badge status-{{ job.status.value }}">{{ job.status.value }}</span>
+                </div>
+
+                <div class="info-label">Episode URL:</div>
+                <div class="info-value url-text">{{ job.episode_url }}</div>
+
+                {% if job.ia_url %}
+                <div class="info-label">Internet Archive URL:</div>
+                <div class="info-value url-text">{{ job.ia_url }}</div>
+                {% endif %}
+
+                <div class="info-label">Worker ID:</div>
+                <div class="info-value">{{ job.worker_id or '-' }}</div>
+
+                <div class="info-label">Worker IP:</div>
+                <div class="info-value">{{ job.worker_ip or '-' }}</div>
+
+                <div class="info-label">Created:</div>
+                <div class="info-value">{{ job.created_at.strftime('%Y-%m-%d %H:%M:%S') if job.created_at else '-' }}</div>
+
+                <div class="info-label">Assigned:</div>
+                <div class="info-value">{{ job.assigned_at.strftime('%Y-%m-%d %H:%M:%S') if job.assigned_at else '-' }}</div>
+
+                <div class="info-label">Completed:</div>
+                <div class="info-value">{{ job.completed_at.strftime('%Y-%m-%d %H:%M:%S') if job.completed_at else '-' }}</div>
+
+                {% if job.error_message %}
+                <div class="info-label">Error:</div>
+                <div class="info-value" style="color: #e74c3c;">{{ job.error_message }}</div>
+                {% endif %}
+
+                <div class="info-label">Retry Count:</div>
+                <div class="info-value">{{ job.retry_count }}</div>
+            </div>
+
+            {% if job.status.value in ['failed', 'expired'] %}
+            <div id="retry-section">
+                <button class="retry-button" id="retry-button" onclick="retryJob()">
+                    🔄 Retry Job
+                </button>
+                <div id="retry-message" style="display: none;"></div>
+            </div>
+            {% endif %}
+        </div>
+
+        {% if job.result_json %}
+        <div class="card">
+            <h2>Result Data (Interactive JSON Viewer)</h2>
+            <div class="json-viewer-container">
+                <json-viewer id="json-viewer"></json-viewer>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if job.transcription %}
+        <div class="card">
+            <h2>Transcription</h2>
+            <div class="text-result">{{ job.transcription }}</div>
+        </div>
+        {% endif %}
+
+        {% if job.diarization %}
+        <div class="card">
+            <h2>Diarization</h2>
+            <div class="text-result">{{ job.diarization }}</div>
+        </div>
+        {% endif %}
+
+        {% if not job.result_json and not job.transcription and not job.diarization %}
+        <div class="card">
+            <p class="no-data">No results available for this job yet.</p>
+        </div>
+        {% endif %}
+    </div>
+
+    <script>
+        async function retryJob() {
+            const button = document.getElementById('retry-button');
+            const message = document.getElementById('retry-message');
+
+            button.disabled = true;
+            button.textContent = 'Retrying...';
+
+            try {
+                const response = await fetch('/api/jobs/{{ job.id }}/retry', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    message.className = 'message success';
+                    message.textContent = data.message + ' - Redirecting...';
+                    message.style.display = 'block';
+
+                    // Redirect to jobs list after 2 seconds
+                    setTimeout(() => {
+                        window.location.href = '/jobs';
+                    }, 2000);
+                } else {
+                    throw new Error(data.detail || 'Failed to retry job');
+                }
+            } catch (error) {
+                message.className = 'message error';
+                message.textContent = 'Error: ' + error.message;
+                message.style.display = 'block';
+                button.disabled = false;
+                button.textContent = '🔄 Retry Job';
+            }
+        }
+    </script>
+
+    <script type="module">
+        import JsonViewer from 'https://cdn.jsdelivr.net/npm/@alenaksu/json-viewer@2.0.0/dist/json-viewer.bundle.js';
+
+        {% if job.result_json %}
+        try {
+            const jsonData = {{ job.result_json|safe }};
+            const viewer = document.getElementById('json-viewer');
+            viewer.data = jsonData;
+            viewer.expanded = true;
+        } catch (error) {
+            document.getElementById('json-viewer').innerHTML =
+                '<p style="color: #e74c3c;">Error parsing JSON: ' + error.message + '</p>';
+        }
+        {% endif %}
+    </script>
+</body>
+</html>

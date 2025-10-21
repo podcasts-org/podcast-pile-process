@@ -26,6 +26,7 @@ class Job(Base):
     # Results
     transcription = Column(Text, nullable=True)
     diarization = Column(Text, nullable=True)
+    result_json = Column(Text, nullable=True)  # JSON results from worker
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -63,7 +64,7 @@ class Job(Base):
         """Mark job as being processed."""
         self.status = JobStatus.PROCESSING
 
-    def mark_completed(self, transcription: str = None, diarization: str = None, ia_url: str = None):
+    def mark_completed(self, transcription: str = None, diarization: str = None, ia_url: str = None, result_json: str = None):
         """Mark job as completed."""
         self.status = JobStatus.COMPLETED
         self.completed_at = datetime.utcnow()
@@ -73,6 +74,8 @@ class Job(Base):
             self.diarization = diarization
         if ia_url:
             self.ia_url = ia_url
+        if result_json:
+            self.result_json = result_json
 
     def mark_failed(self, error_message: str):
         """Mark job as failed."""

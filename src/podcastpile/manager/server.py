@@ -43,6 +43,7 @@ class JobResult(BaseModel):
     transcription: Optional[str] = None
     diarization: Optional[str] = None
     ia_url: Optional[str] = None
+    result_json: Optional[str] = None
 
 
 class StatsResponse(BaseModel):
@@ -138,6 +139,62 @@ async def create_job(job: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(db_job)
     return db_job
+
+
+@app.get("/api/jobs/paginated")
+async def get_jobs_paginated_api(
+    page: int = 1,
+    per_page: int = 50,
+    status_filter: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_admin_auth)
+):
+    """Get paginated jobs list (optimized for millions of jobs)."""
+    # Validate pagination parameters
+    per_page = min(per_page, 100)  # Max 100 per page
+    offset = (page - 1) * per_page
+
+    # Build query
+    query = db.query(Job)
+
+    if status_filter:
+        try:
+            status_enum = JobStatus(status_filter)
+            query = query.filter(Job.status == status_enum)
+        except ValueError:
+            pass
+
+    # Get total count (uses index)
+    total = query.count()
+
+    # Get page of jobs (uses index: created_at)
+    jobs = query.order_by(Job.created_at.desc()).offset(offset).limit(per_page).all()
+
+    total_pages = (total + per_page - 1) // per_page
+
+    return {
+        "jobs": [
+            {
+                "id": job.id,
+                "episode_url": job.episode_url,
+                "status": job.status.value,
+                "worker_id": job.worker_id,
+                "worker_ip": job.worker_ip,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "has_json": job.result_json is not None
+            }
+            for job in jobs
+        ],
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "total_pages": total_pages,
+            "has_prev": page > 1,
+            "has_next": page < total_pages
+        }
+    }
 
 
 @app.get("/api/jobs", response_model=List[JobResponse])
@@ -245,7 +302,8 @@ async def complete_job(
     job.mark_completed(
         transcription=result.transcription,
         diarization=result.diarization,
-        ia_url=result.ia_url
+        ia_url=result.ia_url,
+        result_json=result.result_json
     )
     db.commit()
     return {"status": "completed"}
@@ -381,6 +439,93 @@ async def get_chart_data(
         },
         "avg_processing_time": total_avg_time,
         "status_distribution": status_counts
+    }
+
+
+@app.get("/jobs", response_class=HTMLResponse)
+async def jobs_list(
+    request: Request,
+    page: int = 1,
+    status_filter: Optional[str] = None,
+    _: str = Depends(verify_admin_auth)
+):
+    """Paginated jobs list page."""
+    return templates.TemplateResponse(
+        "jobs_list.html",
+        {
+            "request": request,
+            "page": page,
+            "status_filter": status_filter
+        }
+    )
+
+
+@app.get("/jobs/{job_id}", response_class=HTMLResponse)
+async def job_detail(
+    request: Request,
+    job_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_admin_auth)
+):
+    """Job detail page with JSON viewer."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return templates.TemplateResponse(
+        "job_detail.html",
+        {
+            "request": request,
+            "job": job
+        }
+    )
+
+
+@app.post("/api/jobs/{job_id}/retry")
+async def retry_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_admin_auth)
+):
+    """Admin endpoint to retry a failed or expired job."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Only allow retrying failed or expired jobs
+    if job.status not in [JobStatus.FAILED, JobStatus.EXPIRED]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry job with status '{job.status.value}'. Only 'failed' or 'expired' jobs can be retried."
+        )
+
+    # Reset job to pending state
+    job.status = JobStatus.PENDING
+    job.worker_id = None
+    job.worker_ip = None
+    job.assigned_at = None
+    job.completed_at = None
+    job.expires_at = None
+    job.error_message = None
+    job.retry_count += 1
+
+    # Clear previous results (optional - you might want to keep them)
+    # Uncomment if you want to clear old results on retry:
+    # job.transcription = None
+    # job.diarization = None
+    # job.result_json = None
+
+    db.commit()
+    db.refresh(job)
+
+    return {
+        "status": "success",
+        "message": f"Job #{job_id} has been reset to pending status",
+        "job": {
+            "id": job.id,
+            "status": job.status.value,
+            "retry_count": job.retry_count
+        }
     }
 
 

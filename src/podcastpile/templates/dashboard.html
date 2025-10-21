@@ -440,7 +440,7 @@
         </div>
 
         <div class="jobs-section">
-            <h2>Recent Jobs</h2>
+            <h2>Recent Jobs <a href="/jobs" style="font-size: 14px; font-weight: normal; color: #3498db; text-decoration: none; margin-left: 10px;">View All &rarr;</a></h2>
             <table class="jobs-table">
                 <thead>
                     <tr>
@@ -456,7 +456,7 @@
                 <tbody>
                     {% for job in recent_jobs %}
                     <tr>
-                        <td><strong>#{{ job.id }}</strong></td>
+                        <td><strong><a href="/jobs/{{ job.id }}" style="color: #3498db; text-decoration: none;">#{{ job.id }}</a></strong></td>
                         <td class="url-cell" title="{{ job.episode_url }}">{{ job.episode_url }}</td>
                         <td>
                             <span class="status-badge status-{{ job.status.value }}">
