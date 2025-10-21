@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -65,26 +64,34 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db)):
-    """Render admin dashboard."""
-    # Get statistics
+    """Render admin dashboard (optimized for large datasets)."""
+    # Get statistics with single grouped query instead of 7 separate queries
+    # Uses index: status
+    status_counts = db.query(
+        Job.status,
+        func.count(Job.id).label('count')
+    ).group_by(Job.status).all()
+
+    stats_dict = {status.value: count for status, count in status_counts}
+
     stats = {
-        "total": db.query(Job).count(),
-        "pending": db.query(Job).filter(Job.status == JobStatus.PENDING).count(),
-        "assigned": db.query(Job).filter(Job.status == JobStatus.ASSIGNED).count(),
-        "processing": db.query(Job).filter(Job.status == JobStatus.PROCESSING).count(),
-        "completed": db.query(Job).filter(Job.status == JobStatus.COMPLETED).count(),
-        "failed": db.query(Job).filter(Job.status == JobStatus.FAILED).count(),
-        "expired": db.query(Job).filter(Job.status == JobStatus.EXPIRED).count(),
+        "total": sum(stats_dict.values()),
+        "pending": stats_dict.get(JobStatus.PENDING.value, 0),
+        "assigned": stats_dict.get(JobStatus.ASSIGNED.value, 0),
+        "processing": stats_dict.get(JobStatus.PROCESSING.value, 0),
+        "completed": stats_dict.get(JobStatus.COMPLETED.value, 0),
+        "failed": stats_dict.get(JobStatus.FAILED.value, 0),
+        "expired": stats_dict.get(JobStatus.EXPIRED.value, 0),
     }
 
-    # Get recent jobs
+    # Get recent jobs (limit to 20, uses index: created_at)
     recent_jobs = db.query(Job).order_by(Job.created_at.desc()).limit(20).all()
 
-    # Get active workers
-    active_workers = db.query(Job.worker_id).filter(
-        Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING])
-    ).distinct().all()
-    active_worker_count = len([w for w in active_workers if w[0] is not None])
+    # Get active workers count efficiently (uses index: ix_worker_status)
+    active_worker_count = db.query(Job.worker_id).filter(
+        Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
+        Job.worker_id.isnot(None)
+    ).distinct().count()
 
     return templates.TemplateResponse(
         "dashboard.html",
@@ -99,15 +106,23 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 
 @app.get("/api/stats", response_model=StatsResponse)
 async def get_stats(db: Session = Depends(get_db)):
-    """Get job statistics."""
+    """Get job statistics (optimized for large datasets)."""
+    # Single grouped query instead of 7 separate queries
+    status_counts = db.query(
+        Job.status,
+        func.count(Job.id).label('count')
+    ).group_by(Job.status).all()
+
+    stats_dict = {status.value: count for status, count in status_counts}
+
     return StatsResponse(
-        total_jobs=db.query(Job).count(),
-        pending=db.query(Job).filter(Job.status == JobStatus.PENDING).count(),
-        assigned=db.query(Job).filter(Job.status == JobStatus.ASSIGNED).count(),
-        processing=db.query(Job).filter(Job.status == JobStatus.PROCESSING).count(),
-        completed=db.query(Job).filter(Job.status == JobStatus.COMPLETED).count(),
-        failed=db.query(Job).filter(Job.status == JobStatus.FAILED).count(),
-        expired=db.query(Job).filter(Job.status == JobStatus.EXPIRED).count(),
+        total_jobs=sum(stats_dict.values()),
+        pending=stats_dict.get(JobStatus.PENDING.value, 0),
+        assigned=stats_dict.get(JobStatus.ASSIGNED.value, 0),
+        processing=stats_dict.get(JobStatus.PROCESSING.value, 0),
+        completed=stats_dict.get(JobStatus.COMPLETED.value, 0),
+        failed=stats_dict.get(JobStatus.FAILED.value, 0),
+        expired=stats_dict.get(JobStatus.EXPIRED.value, 0),
     )
 
 
@@ -251,6 +266,115 @@ async def fail_job(
     job.mark_failed(error_message)
     db.commit()
     return {"status": "failed"}
+
+
+@app.get("/api/charts/data")
+async def get_chart_data(db: Session = Depends(get_db)):
+    """Get data for dashboard charts (optimized for large datasets)."""
+    from datetime import timedelta
+
+    now = datetime.utcnow()
+    last_24h = now - timedelta(hours=24)
+
+    # Throughput: jobs completed per hour (only query completed_at, not full rows)
+    # Uses index: ix_status_completed
+    completed_jobs = db.query(Job.completed_at).filter(
+        Job.status == JobStatus.COMPLETED,
+        Job.completed_at >= last_24h
+    ).all()
+
+    # Group by hour
+    hourly_counts = {}
+    for (completed_at,) in completed_jobs:
+        hour_key = completed_at.replace(minute=0, second=0, microsecond=0)
+        hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
+
+    throughput_labels = []
+    throughput_data = []
+    for i in range(24):
+        hour = now - timedelta(hours=23-i)
+        hour_key = hour.replace(minute=0, second=0, microsecond=0)
+        throughput_labels.append(hour_key.strftime("%H:%M"))
+        throughput_data.append(hourly_counts.get(hour_key, 0))
+
+    # Worker performance: jobs completed per worker (aggregated in DB)
+    # Uses index: ix_worker_status
+    worker_stats = db.query(
+        Job.worker_id,
+        func.count(Job.id).label('completed_count')
+    ).filter(
+        Job.status == JobStatus.COMPLETED,
+        Job.worker_id.isnot(None)
+    ).group_by(Job.worker_id).limit(50).all()  # Limit to top 50 workers
+
+    worker_labels = [w[0] for w in worker_stats]
+    worker_data = [w[1] for w in worker_stats]
+
+    # Processing times: ONLY fetch last 20 jobs (ordered by ID descending)
+    # Uses primary key index for fast retrieval
+    recent_completed = db.query(
+        Job.id,
+        Job.assigned_at,
+        Job.completed_at
+    ).filter(
+        Job.status == JobStatus.COMPLETED,
+        Job.assigned_at.isnot(None),
+        Job.completed_at.isnot(None)
+    ).order_by(Job.id.desc()).limit(20).all()
+
+    avg_times = []
+    avg_time_labels = []
+
+    for job_id, assigned_at, completed_at in reversed(recent_completed):
+        processing_time = (completed_at - assigned_at).total_seconds() / 60
+        avg_times.append(round(processing_time, 2))
+        avg_time_labels.append(f"#{job_id}")
+
+    # Overall average processing time: Use SQL AVG for efficiency
+    # Calculate average using database-level aggregation (much faster)
+    avg_result = db.query(
+        func.avg(
+            func.julianday(Job.completed_at) - func.julianday(Job.assigned_at)
+        ).label('avg_days')
+    ).filter(
+        Job.status == JobStatus.COMPLETED,
+        Job.assigned_at.isnot(None),
+        Job.completed_at.isnot(None)
+    ).first()
+
+    # Convert from days to minutes
+    total_avg_time = 0
+    if avg_result and avg_result[0]:
+        total_avg_time = round(avg_result[0] * 24 * 60, 2)
+
+    # Status distribution: Use single query with grouping
+    status_counts_query = db.query(
+        Job.status,
+        func.count(Job.id).label('count')
+    ).group_by(Job.status).all()
+
+    status_counts = {
+        status.value: count
+        for status, count in status_counts_query
+        if count > 0
+    }
+
+    return {
+        "throughput": {
+            "labels": throughput_labels,
+            "data": throughput_data
+        },
+        "workers": {
+            "labels": worker_labels,
+            "data": worker_data
+        },
+        "processing_times": {
+            "labels": avg_time_labels,
+            "data": avg_times
+        },
+        "avg_processing_time": total_avg_time,
+        "status_distribution": status_counts
+    }
 
 
 @app.get("/health")

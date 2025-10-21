@@ -155,12 +155,218 @@
             font-size: 14px;
             font-weight: 600;
         }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .chart-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            position: relative;
+            height: 350px;
+        }
+
+        .chart-container h3 {
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-size: 18px;
+        }
+
+        .chart-canvas-wrapper {
+            position: relative;
+            height: calc(100% - 45px);
+        }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
+        let charts = {};
+
+        async function loadChartData() {
+            try {
+                const response = await fetch('/api/charts/data');
+                const data = await response.json();
+                updateCharts(data);
+            } catch (error) {
+                console.error('Error loading chart data:', error);
+            }
+        }
+
+        function updateCharts(data) {
+            // Throughput chart
+            if (charts.throughput) {
+                charts.throughput.data.labels = data.throughput.labels;
+                charts.throughput.data.datasets[0].data = data.throughput.data;
+                charts.throughput.update('none');
+            }
+
+            // Worker performance chart
+            if (charts.workers) {
+                charts.workers.data.labels = data.workers.labels;
+                charts.workers.data.datasets[0].data = data.workers.data;
+                charts.workers.update('none');
+            }
+
+            // Processing times chart
+            if (charts.processingTimes) {
+                charts.processingTimes.data.labels = data.processing_times.labels;
+                charts.processingTimes.data.datasets[0].data = data.processing_times.data;
+                charts.processingTimes.update('none');
+            }
+
+            // Status distribution chart
+            if (charts.statusDist) {
+                charts.statusDist.data.labels = Object.keys(data.status_distribution);
+                charts.statusDist.data.datasets[0].data = Object.values(data.status_distribution);
+                charts.statusDist.update('none');
+            }
+
+            // Update avg time display
+            const avgTimeEl = document.getElementById('avg-processing-time');
+            if (avgTimeEl) {
+                avgTimeEl.textContent = data.avg_processing_time + ' min';
+            }
+        }
+
+        function initCharts() {
+            // Throughput chart
+            const throughputCtx = document.getElementById('throughputChart');
+            if (throughputCtx) {
+                charts.throughput = new Chart(throughputCtx, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: 'Jobs Completed',
+                            data: [],
+                            borderColor: '#3498db',
+                            backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                            tension: 0.4,
+                            fill: true
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: false }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: { stepSize: 1 }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Worker performance chart
+            const workersCtx = document.getElementById('workersChart');
+            if (workersCtx) {
+                charts.workers = new Chart(workersCtx, {
+                    type: 'bar',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: 'Jobs Completed',
+                            data: [],
+                            backgroundColor: '#27ae60'
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: false }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                ticks: { stepSize: 1 }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Processing times chart
+            const processingCtx = document.getElementById('processingTimesChart');
+            if (processingCtx) {
+                charts.processingTimes = new Chart(processingCtx, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            label: 'Processing Time (min)',
+                            data: [],
+                            borderColor: '#f39c12',
+                            backgroundColor: 'rgba(243, 156, 18, 0.1)',
+                            tension: 0.4
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: false }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Status distribution chart
+            const statusCtx = document.getElementById('statusDistChart');
+            if (statusCtx) {
+                charts.statusDist = new Chart(statusCtx, {
+                    type: 'doughnut',
+                    data: {
+                        labels: [],
+                        datasets: [{
+                            data: [],
+                            backgroundColor: [
+                                '#f39c12', // pending
+                                '#3498db', // assigned
+                                '#2980b9', // processing
+                                '#27ae60', // completed
+                                '#e74c3c', // failed
+                                '#95a5a6'  // expired
+                            ]
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                position: 'right'
+                            }
+                        }
+                    }
+                });
+            }
+
+            loadChartData();
+        }
+
         // Auto-refresh every 5 seconds
-        setTimeout(() => {
-            location.reload();
-        }, 5000);
+        setInterval(() => {
+            loadChartData();
+            setTimeout(() => location.reload(), 5000);
+        }, 10000);
+
+        // Initialize charts when page loads
+        window.addEventListener('load', initCharts);
     </script>
 </head>
 <body>
@@ -199,6 +405,37 @@
             <div class="stat-card">
                 <h3>Active Workers</h3>
                 <div class="value">{{ active_workers }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Avg Processing Time</h3>
+                <div class="value" id="avg-processing-time">0 min</div>
+            </div>
+        </div>
+
+        <div class="charts-grid">
+            <div class="chart-container">
+                <h3>Throughput (Last 24 Hours)</h3>
+                <div class="chart-canvas-wrapper">
+                    <canvas id="throughputChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3>Worker Performance</h3>
+                <div class="chart-canvas-wrapper">
+                    <canvas id="workersChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3>Processing Times (Last 20 Jobs)</h3>
+                <div class="chart-canvas-wrapper">
+                    <canvas id="processingTimesChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h3>Status Distribution</h3>
+                <div class="chart-canvas-wrapper">
+                    <canvas id="statusDistChart"></canvas>
+                </div>
             </div>
         </div>
 

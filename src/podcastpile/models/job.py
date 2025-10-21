@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Enum as SQLEnum
+from sqlalchemy import Column, Integer, String, DateTime, Text, Enum as SQLEnum, Index
 from datetime import datetime, timedelta
 from enum import Enum
 from .database import Base
@@ -19,8 +19,8 @@ class Job(Base):
     id = Column(Integer, primary_key=True, index=True)
     episode_url = Column(String, nullable=False)
     ia_url = Column(String, nullable=True)
-    status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False)
-    worker_id = Column(String, nullable=True)
+    status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True)
+    worker_id = Column(String, nullable=True, index=True)
     worker_ip = Column(String, nullable=True)
 
     # Results
@@ -28,10 +28,18 @@ class Job(Base):
     diarization = Column(Text, nullable=True)
 
     # Timestamps
-    created_at = Column(DateTime, default=datetime.utcnow)
-    assigned_at = Column(DateTime, nullable=True)
-    completed_at = Column(DateTime, nullable=True)
-    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    assigned_at = Column(DateTime, nullable=True, index=True)
+    completed_at = Column(DateTime, nullable=True, index=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+
+    # Composite indexes for common queries
+    __table_args__ = (
+        Index('ix_status_created', 'status', 'created_at'),
+        Index('ix_status_completed', 'status', 'completed_at'),
+        Index('ix_status_expires', 'status', 'expires_at'),
+        Index('ix_worker_status', 'worker_id', 'status'),
+    )
 
     # Error tracking
     error_message = Column(Text, nullable=True)
