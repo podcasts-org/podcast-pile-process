@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+pydantic
+python-multipart
+jinja2
+httpx
+python-dateutil
+click
