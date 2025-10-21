@@ -10,7 +10,7 @@ import os
 
 from ..models import get_db, Job, JobStatus, init_db
 from ..config import config
-from .auth import verify_worker_auth, get_client_ip
+from .auth import verify_worker_auth, verify_admin_auth, get_client_ip
 
 app = FastAPI(title="Podcast Pile Manager", version="0.1.0")
 
@@ -63,7 +63,11 @@ async def startup_event():
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request, db: Session = Depends(get_db)):
+async def dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_admin_auth)
+):
     """Render admin dashboard (optimized for large datasets)."""
     # Get statistics with single grouped query instead of 7 separate queries
     # Uses index: status
@@ -269,7 +273,10 @@ async def fail_job(
 
 
 @app.get("/api/charts/data")
-async def get_chart_data(db: Session = Depends(get_db)):
+async def get_chart_data(
+    db: Session = Depends(get_db),
+    _: str = Depends(verify_admin_auth)
+):
     """Get data for dashboard charts (optimized for large datasets)."""
     from datetime import timedelta
 

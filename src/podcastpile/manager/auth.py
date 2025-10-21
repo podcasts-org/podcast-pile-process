@@ -1,6 +1,10 @@
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, Depends
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from typing import Optional
+import secrets
 from ..config import config
+
+security = HTTPBasic()
 
 
 async def verify_worker_auth(x_worker_password: Optional[str] = Header(None)):
@@ -21,6 +25,31 @@ async def verify_worker_auth(x_worker_password: Optional[str] = Header(None)):
         )
 
     return True
+
+
+async def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify admin authentication if enabled."""
+    if not config.ADMIN_AUTH_ENABLED:
+        return True
+
+    # Use constant-time comparison to prevent timing attacks
+    correct_username = secrets.compare_digest(
+        credentials.username.encode("utf8"),
+        config.ADMIN_USERNAME.encode("utf8")
+    )
+    correct_password = secrets.compare_digest(
+        credentials.password.encode("utf8"),
+        config.ADMIN_PASSWORD.encode("utf8")
+    )
+
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    return credentials.username
 
 
 def get_client_ip(request) -> str:

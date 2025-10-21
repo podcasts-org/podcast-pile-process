@@ -37,7 +37,10 @@ Configuration options:
 - `HOST`: Server host (default: 0.0.0.0)
 - `PORT`: Server port (default: 8000)
 - `WORKER_AUTH_ENABLED`: Enable worker authentication (default: false)
-- `WORKER_PASSWORD`: Password for worker authentication (required if auth enabled)
+- `WORKER_PASSWORD`: Password for worker authentication (required if worker auth enabled)
+- `ADMIN_AUTH_ENABLED`: Enable admin dashboard authentication (default: false)
+- `ADMIN_USERNAME`: Username for admin login (default: admin)
+- `ADMIN_PASSWORD`: Password for admin login (required if admin auth enabled)
 - `JOB_TIMEOUT_HOURS`: Job timeout in hours (default: 2)
 
 ## Running
@@ -111,7 +114,19 @@ Once the server is running, visit `http://localhost:8000/docs` for interactive A
 - `POST /api/jobs/{job_id}/complete` - Submit job results (requires auth if enabled)
 - `POST /api/jobs/{job_id}/fail` - Report job failure (requires auth if enabled)
 
-## Worker Authentication
+## Authentication
+
+### Admin Dashboard Authentication
+
+To protect the admin dashboard and charts with a password:
+
+1. Set `ADMIN_AUTH_ENABLED=true` in `.env`
+2. Set `ADMIN_USERNAME=admin` in `.env` (or your preferred username)
+3. Set `ADMIN_PASSWORD=your-secure-password` in `.env`
+
+When enabled, accessing the dashboard at `http://localhost:8000` will prompt for HTTP Basic Authentication credentials.
+
+### Worker Authentication
 
 To enable worker authentication:
 
@@ -127,6 +142,8 @@ curl -X POST http://localhost:8000/api/jobs/request \
   -H "Content-Type: application/json" \
   -d '{"worker_id": "worker-1"}'
 ```
+
+**Note:** Admin and worker authentication are independent and can be enabled separately or together.
 
 ## Development
 
