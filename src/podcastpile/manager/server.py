@@ -22,6 +22,7 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 # Pydantic models for API
 class JobCreate(BaseModel):
     episode_url: str
+    language: Optional[str] = None  # ISO 639-1 language code (e.g., 'en', 'es', 'fr')
 
 
 class JobResponse(BaseModel):
@@ -30,6 +31,7 @@ class JobResponse(BaseModel):
     ia_url: Optional[str]
     status: JobStatus
     worker_id: Optional[str]
+    language: Optional[str]
     created_at: datetime
     assigned_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -134,7 +136,7 @@ async def get_stats(db: Session = Depends(get_db)):
 @app.post("/api/jobs", response_model=JobResponse)
 async def create_job(job: JobCreate, db: Session = Depends(get_db)):
     """Create a new job."""
-    db_job = Job(episode_url=job.episode_url)
+    db_job = Job(episode_url=job.episode_url, language=job.language)
     db.add(db_job)
     db.commit()
     db.refresh(db_job)
@@ -180,6 +182,7 @@ async def get_jobs_paginated_api(
                 "status": job.status.value,
                 "worker_id": job.worker_id,
                 "worker_ip": job.worker_ip,
+                "language": job.language,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "has_json": job.result_json is not None
@@ -224,10 +227,18 @@ async def get_job(job_id: int, db: Session = Depends(get_db)):
 async def request_job(
     request: Request,
     worker_id: str,
+    languages: Optional[str] = None,  # Comma-separated language codes (e.g., "en,es,fr")
     db: Session = Depends(get_db),
     _: bool = Depends(verify_worker_auth)
 ):
-    """Worker requests a job to process."""
+    """Worker requests a job to process.
+
+    Args:
+        worker_id: Unique identifier for the worker
+        languages: Optional comma-separated list of language codes the worker can handle.
+                  If provided, only jobs matching these languages (or jobs with no language set) will be returned.
+                  Example: "en" or "en,es,fr"
+    """
     # Expire old jobs first
     expired_jobs = db.query(Job).filter(
         Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
@@ -239,10 +250,27 @@ async def request_job(
         job.worker_id = None
     db.commit()
 
-    # Find next pending job
-    job = db.query(Job).filter(Job.status == JobStatus.PENDING).first()
+    # Build query for pending jobs
+    query = db.query(Job).filter(Job.status == JobStatus.PENDING)
+
+    # Apply language filter if worker specified languages
+    if languages:
+        language_list = [lang.strip() for lang in languages.split(',')]
+        # Match jobs with specified languages OR jobs with no language set (NULL)
+        # Uses index: ix_status_language
+        query = query.filter(
+            (Job.language.in_(language_list)) | (Job.language.is_(None))
+        )
+
+    # Find next pending job (ordered by creation time for fairness)
+    job = query.order_by(Job.created_at.asc()).first()
 
     if not job:
+        if languages:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No jobs available for languages: {languages}"
+            )
         raise HTTPException(status_code=404, detail="No jobs available")
 
     # Get worker IP and assign job
@@ -254,6 +282,7 @@ async def request_job(
     return {
         "job_id": job.id,
         "episode_url": job.episode_url,
+        "language": job.language,
         "expires_at": job.expires_at
     }
 

@@ -228,11 +228,11 @@
                         <th>ID</th>
                         <th>Episode URL</th>
                         <th>Status</th>
+                        <th>Lang</th>
                         <th>Worker</th>
                         <th>IP</th>
                         <th>Created</th>
                         <th>Completed</th>
-                        <th>Actions</th>
                     </tr>
                 </thead>
                 <tbody id="jobs-tbody">
@@ -295,6 +295,7 @@
                     </td>
                     <td class="url-cell" title="${job.episode_url}">${job.episode_url}</td>
                     <td><span class="status-badge status-${job.status}">${job.status}</span></td>
+                    <td>${job.language || '-'}</td>
                     <td>${job.worker_id || '-'}</td>
                     <td>${job.worker_ip || '-'}</td>
                     <td>${job.created_at ? new Date(job.created_at).toLocaleString() : '-'}</td>

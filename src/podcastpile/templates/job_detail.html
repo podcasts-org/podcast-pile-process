@@ -207,6 +207,9 @@
                 <div class="info-label">Worker IP:</div>
                 <div class="info-value">{{ job.worker_ip or '-' }}</div>
 
+                <div class="info-label">Language:</div>
+                <div class="info-value">{{ job.language or 'Not specified' }}</div>
+
                 <div class="info-label">Created:</div>
                 <div class="info-value">{{ job.created_at.strftime('%Y-%m-%d %H:%M:%S') if job.created_at else '-' }}</div>
 

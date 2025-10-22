@@ -22,6 +22,7 @@ class Job(Base):
     status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True)
     worker_id = Column(String, nullable=True, index=True)
     worker_ip = Column(String, nullable=True)
+    language = Column(String, nullable=True, index=True)  # Language code (e.g., 'en', 'es', 'fr')
 
     # Results
     transcription = Column(Text, nullable=True)
@@ -40,6 +41,7 @@ class Job(Base):
         Index('ix_status_completed', 'status', 'completed_at'),
         Index('ix_status_expires', 'status', 'expires_at'),
         Index('ix_worker_status', 'worker_id', 'status'),
+        Index('ix_status_language', 'status', 'language'),  # For language-filtered worker queries
     )
 
     # Error tracking
