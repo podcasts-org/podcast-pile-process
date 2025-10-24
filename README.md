@@ -83,7 +83,7 @@ Start a worker to process jobs:
 
 ```bash
 # Basic usage (processes English jobs only by default)
-ppcli worker -m http://localhost:8000
+ppcli am http://localhost:8000
 
 # With worker ID and password
 ppcli worker -m http://localhost:8000 -i my-worker -p worker-password

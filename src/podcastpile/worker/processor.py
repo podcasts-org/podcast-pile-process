@@ -368,14 +368,17 @@ class PodcastPileWorker:
 
     def update_job_status(self, job_id: int, status: str) -> bool:
         """Update job status on manager"""
-        url = f"{self.manager_url}/api/jobs/{job_id}/status"
+        # Use the /start endpoint when marking as processing
+        if status == "processing":
+            url = f"{self.manager_url}/api/jobs/{job_id}/start"
+            params = {"worker_id": self.worker_id}
+        else:
+            # For other statuses, we don't have a generic endpoint
+            # Just skip the update since complete/fail have their own endpoints
+            return True
 
         try:
-            response = requests.post(
-                url,
-                json={"status": status},
-                headers=self.headers
-            )
+            response = requests.post(url, params=params, headers=self.headers)
             response.raise_for_status()
             logger.info(f"Updated job #{job_id} status to {status}")
             return True
@@ -407,8 +410,10 @@ class PodcastPileWorker:
             "processed_at": results.get("processed_at")
         }
 
+        params = {"worker_id": self.worker_id}
+
         try:
-            response = requests.post(url, json=payload, headers=self.headers)
+            response = requests.post(url, params=params, json=payload, headers=self.headers)
             response.raise_for_status()
             logger.info(f"✓ Submitted results for job #{job_id}")
             return True
@@ -420,13 +425,13 @@ class PodcastPileWorker:
     def report_failure(self, job_id: int, error_message: str) -> bool:
         """Report job failure to manager"""
         url = f"{self.manager_url}/api/jobs/{job_id}/fail"
+        params = {
+            "worker_id": self.worker_id,
+            "error_message": error_message
+        }
 
         try:
-            response = requests.post(
-                url,
-                json={"error": error_message},
-                headers=self.headers
-            )
+            response = requests.post(url, params=params, headers=self.headers)
             response.raise_for_status()
             logger.info(f"Reported failure for job #{job_id}")
             return True
