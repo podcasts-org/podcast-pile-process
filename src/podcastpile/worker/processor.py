@@ -21,12 +21,12 @@ import nemo.collections.asr as nemo_asr
 logger = logging.getLogger(__name__)
 
 
-def get_gpu_info() -> Optional[str]:
+def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
     """Get GPU device information"""
     try:
         import torch
         if torch.cuda.is_available():
-            device_id = torch.cuda.current_device()
+            device_id = gpu_id if gpu_id is not None else torch.cuda.current_device()
             gpu_name = torch.cuda.get_device_name(device_id)
             return f"{gpu_name} (CUDA {device_id})"
     except Exception as e:
@@ -34,18 +34,31 @@ def get_gpu_info() -> Optional[str]:
     return None
 
 
+def get_available_gpus() -> list:
+    """Get list of available GPU IDs"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return list(range(torch.cuda.device_count()))
+    except Exception:
+        pass
+    return []
+
+
 class AudioProcessor:
     """Handles audio processing and diarization"""
 
-    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None):
+    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None):
         """
         Initialize audio processor with models
 
         Args:
             config: Streaming configuration (very_high_latency, high_latency, low_latency, ultra_low_latency)
             model_path: Optional path to custom .nemo model file
+            gpu_id: GPU device ID to use (None for auto-select)
         """
         self.config_name = config
+        self.gpu_id = gpu_id
         self.configs = {
             "very_high_latency": {
                 "CHUNK_SIZE": 340, "RIGHT_CONTEXT": 40, "FIFO_SIZE": 40,
@@ -71,6 +84,15 @@ class AudioProcessor:
 
     def load_models(self):
         """Load diarization and ASR models"""
+        # Set GPU device if specified
+        if self.gpu_id is not None:
+            try:
+                import torch
+                torch.cuda.set_device(self.gpu_id)
+                logger.info(f"Using GPU {self.gpu_id}: {torch.cuda.get_device_name(self.gpu_id)}")
+            except Exception as e:
+                logger.warning(f"Could not set GPU {self.gpu_id}: {e}")
+
         logger.info("Loading diarization model...")
         if self.model_path and os.path.exists(self.model_path):
             self.diar_model = SortformerEncLabelModel.restore_from(
@@ -219,7 +241,7 @@ class AudioProcessor:
         processing_time = time.time() - start_time
 
         # Get GPU info
-        gpu_info = get_gpu_info()
+        gpu_info = get_gpu_info(self.gpu_id)
 
         # Create output record with all metadata
         output_record = {
@@ -253,7 +275,8 @@ class PodcastPileWorker:
         worker_id: str,
         worker_password: Optional[str] = None,
         config: str = "high_latency",
-        model_path: Optional[str] = None
+        model_path: Optional[str] = None,
+        gpu_id: Optional[int] = None
     ):
         """
         Initialize worker
@@ -264,11 +287,13 @@ class PodcastPileWorker:
             worker_password: Optional password for worker authentication
             config: Diarization config (very_high_latency, high_latency, low_latency, ultra_low_latency)
             model_path: Optional path to custom .nemo model file
+            gpu_id: GPU device ID to use (None for auto-select)
         """
         self.manager_url = manager_url.rstrip('/')
         self.worker_id = worker_id
         self.worker_password = worker_password
-        self.processor = AudioProcessor(config=config, model_path=model_path)
+        self.gpu_id = gpu_id
+        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id)
 
         # Headers for API requests
         self.headers = {}

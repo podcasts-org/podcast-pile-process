@@ -25,6 +25,7 @@ setup(
             "librosa>=0.10.0",
             "soundfile>=0.12.0",
             "nemo_toolkit[asr]>=1.20.0",
+            "megatron-core",
         ],
         # Development dependencies
         "dev": [

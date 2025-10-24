@@ -99,27 +99,45 @@ ppcli worker -m http://localhost:8000 --once
 
 # Verbose logging
 ppcli worker -m http://localhost:8000 -v
+
+# GPU Selection - Use specific GPU
+ppcli worker -m http://localhost:8000 --gpu 0
+
+# Multi-GPU - Spawn worker on each available GPU
+ppcli worker -m http://localhost:8000 --all-gpus
+
+# Multi-GPU - Use specific GPUs (e.g., 0, 1, and 3)
+ppcli worker -m http://localhost:8000 --gpus 0,1,3
 ```
 
 Worker Options:
 - `-m, --manager`: Manager URL (required)
-- `-i, --worker-id`: Worker ID (default: hostname)
+- `-i, --worker-id`: Worker ID (default: hostname-gpu{N})
 - `-p, --password`: Worker password (can also use WORKER_PASSWORD env var)
 - `-l, --languages`: Comma-separated language codes to process (default: en)
 - `-c, --config`: Diarization configuration - `very_high_latency`, `high_latency` (default), `low_latency`, `ultra_low_latency`
 - `--model`: Path to custom .nemo model file
+- `--gpu`: GPU device ID to use (e.g., 0, 1, 2)
+- `--all-gpus`: Spawn a worker process on each available GPU
+- `--gpus`: Comma-separated list of GPU IDs to use (e.g., "0,1,3")
 - `--once`: Process one job and exit
 - `--poll-interval`: Seconds between polling for jobs (default: 10)
 - `-v, --verbose`: Enable verbose logging
 
 The worker will:
-1. Load NeMo diarization and ASR models (this takes a while on first run)
+1. **Load models once at startup** - NeMo diarization and ASR models are loaded once and reused for all jobs
 2. Request jobs from the manager (filtered by language)
 3. Download the audio file
-4. Perform diarization and transcription
+4. Perform diarization and transcription on the specified GPU
 5. Compute SHA256 and MD5 hashes of the audio file
-6. Upload results (JSON, transcription, diarization) back to the manager
+6. Upload results (JSON, transcription, diarization, GPU info, processing time) back to the manager
 7. Repeat continuously (unless `--once` is used)
+
+**Multi-GPU Support:**
+- When using `--all-gpus` or `--gpus`, each GPU gets its own worker process
+- Each worker has a unique ID: `hostname-gpu0`, `hostname-gpu1`, etc.
+- Press Ctrl+C once to gracefully stop all workers
+- All workers share the same configuration and can process jobs in parallel
 
 ## CLI Commands
 
