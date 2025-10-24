@@ -31,7 +31,14 @@ pip install -e ".[worker]"
 This will install:
 - librosa (audio processing)
 - soundfile (audio I/O)
-- nemo_toolkit[asr] (NeMo ASR models)
+- nemo_toolkit[asr] (NeMo ASR models for English)
+
+**For Chinese language support**, also install:
+```bash
+pip install fireredasr huggingface-hub
+```
+
+The FireRedASR model will be automatically downloaded from HuggingFace on first use.
 
 Or using requirements.txt:
 
@@ -123,13 +130,18 @@ Worker Options:
 - `-v, --verbose`: Enable verbose logging
 
 The worker will:
-1. **Load models once at startup** - NeMo diarization and ASR models are loaded once and reused for all jobs
+1. **Load models once at startup** - Models are loaded based on selected languages:
+   - **English/other**: Parakeet TDT (NeMo ASR)
+   - **Chinese (zh)**: FireRedASR-AED-L
+   - If languages contain `zh` or `cn`, FireRedASR is loaded
+   - If languages contain non-Chinese codes, Parakeet is loaded
 2. Request jobs from the manager (filtered by language)
 3. Download the audio file
-4. Perform diarization and transcription on the specified GPU
-5. Compute SHA256 and MD5 hashes of the audio file
-6. Upload results (JSON, transcription, diarization, GPU info, processing time) back to the manager
-7. Repeat continuously (unless `--once` is used)
+4. Perform diarization (always uses NeMo SortFormer)
+5. Perform transcription using the appropriate model based on job language
+6. Compute SHA256 and MD5 hashes of the audio file
+7. Upload results (JSON, transcription, diarization, GPU info, processing time) back to the manager
+8. Repeat continuously (unless `--once` is used)
 
 **Multi-GPU Support:**
 - When using `--all-gpus` or `--gpus`, each GPU gets its own worker process

@@ -48,7 +48,7 @@ def get_available_gpus() -> list:
 class AudioProcessor:
     """Handles audio processing and diarization"""
 
-    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None):
+    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None, languages: str = "en"):
         """
         Initialize audio processor with models
 
@@ -56,9 +56,11 @@ class AudioProcessor:
             config: Streaming configuration (very_high_latency, high_latency, low_latency, ultra_low_latency)
             model_path: Optional path to custom .nemo model file
             gpu_id: GPU device ID to use (None for auto-select)
+            languages: Comma-separated language codes to determine which models to load
         """
         self.config_name = config
         self.gpu_id = gpu_id
+        self.languages = [lang.strip().lower() for lang in languages.split(',')]
         self.configs = {
             "very_high_latency": {
                 "CHUNK_SIZE": 340, "RIGHT_CONTEXT": 40, "FIFO_SIZE": 40,
@@ -79,7 +81,8 @@ class AudioProcessor:
         }
 
         self.diar_model = None
-        self.asr_model = None
+        self.asr_model = None  # Parakeet (English)
+        self.zh_asr_model = None  # FireRedASR (Chinese)
         self.model_path = model_path
 
     def load_models(self):
@@ -108,12 +111,43 @@ class AudioProcessor:
         self.diar_model.eval()
         logger.info("✓ Diarization model loaded")
 
-        logger.info("Loading ASR model...")
-        self.asr_model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name="nvidia/parakeet-tdt-0.6b-v3"
-        )
-        self.asr_model.eval()
-        logger.info("✓ ASR model loaded")
+        # Determine which ASR models to load based on languages
+        needs_chinese = 'zh' in self.languages or 'cn' in self.languages
+        needs_english = any(lang not in ['zh', 'cn'] for lang in self.languages)
+
+        # Load Parakeet (English) if needed
+        if needs_english:
+            logger.info("Loading Parakeet ASR model (English)...")
+            self.asr_model = nemo_asr.models.ASRModel.from_pretrained(
+                model_name="nvidia/parakeet-tdt-0.6b-v3"
+            )
+            self.asr_model.eval()
+            logger.info("✓ Parakeet ASR model loaded")
+
+        # Load FireRedASR (Chinese) if needed
+        if needs_chinese:
+            logger.info("Loading FireRedASR model (Chinese)...")
+            try:
+                from fireredasr.models.fireredasr import FireRedAsr
+                from huggingface_hub import snapshot_download
+
+                # Download model from HuggingFace if not cached
+                logger.info("Downloading/loading FireRedASR-AED-L from HuggingFace...")
+                model_path = snapshot_download(
+                    repo_id="FireRedTeam/FireRedASR-AED-L",
+                    cache_dir="./pretrained_models"
+                )
+
+                # Use AED variant for better accuracy
+                self.zh_asr_model = FireRedAsr.from_pretrained("aed", model_path)
+                logger.info("✓ FireRedASR model loaded")
+            except ImportError as e:
+                logger.error(f"Failed to import FireRedASR: {e}")
+                logger.error("Install with: pip install fireredasr huggingface-hub")
+                raise
+            except Exception as e:
+                logger.error(f"Failed to load FireRedASR model: {e}")
+                raise
 
         # Set streaming configuration
         config = self.configs[self.config_name]
@@ -222,10 +256,42 @@ class AudioProcessor:
             temp_files.append(temp_path)
 
         try:
-            # Transcribe all segments at once
+            # Transcribe all segments at once using appropriate model
+            is_chinese = language and (language.lower() == 'zh' or language.lower() == 'cn')
+
             logger.info(f"Transcribing {len(temp_files)} segments...")
-            batch_results = self.asr_model.transcribe(temp_files)
-            transcriptions = [result.text for result in batch_results]
+            if is_chinese and self.zh_asr_model:
+                # Use FireRedASR for Chinese
+                logger.info("Using FireRedASR for Chinese transcription")
+
+                # Create batch inputs for FireRedASR
+                batch_uttid = [f"segment_{i}" for i in range(len(temp_files))]
+
+                results_zh = self.zh_asr_model.transcribe(
+                    batch_uttid,
+                    temp_files,
+                    {
+                        "use_gpu": 1 if self.gpu_id is not None else 0,
+                        "beam_size": 3,
+                        "nbest": 1,
+                        "decode_max_len": 0,
+                        "softmax_smoothing": 1.0,
+                        "aed_length_penalty": 0.0,
+                        "eos_penalty": 1.0
+                    }
+                )
+
+                # Extract transcriptions from FireRedASR results
+                transcriptions = [results_zh[uttid][0]['text'] for uttid in batch_uttid]
+
+            elif self.asr_model:
+                # Use Parakeet for English/other languages
+                logger.info("Using Parakeet for transcription")
+                batch_results = self.asr_model.transcribe(temp_files)
+                transcriptions = [result.text for result in batch_results]
+            else:
+                logger.error("No ASR model available for this language")
+                transcriptions = ["" for _ in temp_files]
 
             # Add transcriptions to results
             for i in range(len(results)):
@@ -276,7 +342,8 @@ class PodcastPileWorker:
         worker_password: Optional[str] = None,
         config: str = "high_latency",
         model_path: Optional[str] = None,
-        gpu_id: Optional[int] = None
+        gpu_id: Optional[int] = None,
+        languages: str = "en"
     ):
         """
         Initialize worker
@@ -288,12 +355,13 @@ class PodcastPileWorker:
             config: Diarization config (very_high_latency, high_latency, low_latency, ultra_low_latency)
             model_path: Optional path to custom .nemo model file
             gpu_id: GPU device ID to use (None for auto-select)
+            languages: Comma-separated language codes worker will process
         """
         self.manager_url = manager_url.rstrip('/')
         self.worker_id = worker_id
         self.worker_password = worker_password
         self.gpu_id = gpu_id
-        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id)
+        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id, languages=languages)
 
         # Headers for API requests
         self.headers = {}

@@ -158,7 +158,8 @@ def _run_single_worker(manager, worker_id, password, languages, config, model, o
             worker_password=password,
             config=config,
             model_path=model,
-            gpu_id=gpu_id
+            gpu_id=gpu_id,
+            languages=languages
         )
     except Exception as e:
         click.echo(f"Error creating worker: {e}", err=True)
