@@ -276,22 +276,20 @@ class AudioProcessor:
 
             logger.info(f"Transcribing {len(temp_files)} segments...")
             if is_chinese and self.zh_asr_model:
-                # Use Paraformer for Chinese (batch_size=1 with progress bar)
+                # Use Paraformer for Chinese - process all files at once
                 logger.info("Using Paraformer for Chinese transcription")
 
-                from tqdm import tqdm
+                # Pass all temp files at once
+                paraformer_results = self.zh_asr_model.generate(
+                    input=temp_files,
+                    batch_size_s=300
+                )
 
+                # Extract text from results - format is [{'key': 'filename', 'text': 'transcription'}, ...]
                 transcriptions = []
-                # Process one file at a time with progress bar
-                for temp_file in tqdm(temp_files, desc="Transcribing segments", unit="segment", dynamic_ncols=True):
-                    results = self.zh_asr_model.generate(
-                        input=temp_file,
-                        batch_size_s=300
-                    )
-
-                    # Extract text from result - format is [{'key': 'filename', 'text': 'transcription'}]
-                    if results and len(results) > 0 and isinstance(results[0], dict):
-                        transcriptions.append(results[0].get('text', ''))
+                for result in paraformer_results:
+                    if isinstance(result, dict):
+                        transcriptions.append(result.get('text', ''))
                     else:
                         transcriptions.append('')
 
@@ -305,8 +303,11 @@ class AudioProcessor:
                 transcriptions = ["" for _ in temp_files]
 
             # Add transcriptions to results
+            logger.info(f"Adding {len(transcriptions)} transcriptions to {len(results)} segments")
             for i in range(len(results)):
                 results[i]["transcription"] = transcriptions[i]
+                if i < 3:  # Log first 3 for debugging
+                    logger.debug(f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'...")
 
         finally:
             # Clean up temporary files
