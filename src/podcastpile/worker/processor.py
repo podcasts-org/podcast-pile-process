@@ -8,6 +8,8 @@ import json
 import hashlib
 import tempfile
 import logging
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 import requests
@@ -17,6 +19,19 @@ from nemo.collections.asr.models import SortformerEncLabelModel
 import nemo.collections.asr as nemo_asr
 
 logger = logging.getLogger(__name__)
+
+
+def get_gpu_info() -> Optional[str]:
+    """Get GPU device information"""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+            gpu_name = torch.cuda.get_device_name(device_id)
+            return f"{gpu_name} (CUDA {device_id})"
+    except Exception as e:
+        logger.debug(f"Could not get GPU info: {e}")
+    return None
 
 
 class AudioProcessor:
@@ -126,13 +141,19 @@ class AudioProcessor:
             "md5": md5_hash.hexdigest()
         }
 
-    def diarize_audio(self, audio_path: str) -> Dict:
+    def diarize_audio(self, audio_path: str, episode_url: str = None, language: str = None) -> Dict:
         """
         Diarize a single audio file and return results
 
+        Args:
+            audio_path: Path to audio file
+            episode_url: Original episode URL
+            language: Language code
+
         Returns:
-            Dict with diarization results, transcriptions, and file hashes
+            Dict with diarization results, transcriptions, file hashes, and metadata
         """
+        start_time = time.time()
         # Compute hashes first (before any conversion)
         logger.info(f"Computing file hashes for {audio_path}...")
         hashes = self.compute_file_hashes(audio_path)
@@ -194,18 +215,31 @@ class AudioProcessor:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
 
-        # Create output record
+        # Calculate processing time
+        processing_time = time.time() - start_time
+
+        # Get GPU info
+        gpu_info = get_gpu_info()
+
+        # Create output record with all metadata
         output_record = {
             "audio_filepath": str(Path(audio_path).absolute()),
+            "episode_url": episode_url,
+            "language": language,
             "duration": duration,
             "num_segments": len(results),
             "segments": results,
             "file_hashes": hashes,
-            "num_speakers": len(set(s['speaker'] for s in results))
+            "num_speakers": len(set(s['speaker'] for s in results)),
+            "processing_time": processing_time,
+            "gpu_info": gpu_info,
+            "processed_at": datetime.utcnow().isoformat() + "Z"
         }
 
-        logger.info(f"✓ Processed {len(results)} segments")
+        logger.info(f"✓ Processed {len(results)} segments in {processing_time:.2f}s")
         logger.info(f"  Speakers detected: {output_record['num_speakers']}")
+        if gpu_info:
+            logger.info(f"  GPU: {gpu_info}")
 
         return output_record
 
@@ -342,7 +376,10 @@ class PodcastPileWorker:
         payload = {
             "result_json": json.dumps(results),
             "transcription": self._format_transcription(results),
-            "diarization": self._format_diarization(results)
+            "diarization": self._format_diarization(results),
+            "processing_duration": results.get("processing_time"),
+            "worker_gpu": results.get("gpu_info"),
+            "processed_at": results.get("processed_at")
         }
 
         try:
@@ -406,6 +443,7 @@ class PodcastPileWorker:
         """
         job_id = job["job_id"]
         episode_url = job["episode_url"]
+        language = job.get("language")
 
         logger.info(f"Processing job #{job_id}...")
 
@@ -418,8 +456,12 @@ class PodcastPileWorker:
             # Download audio
             audio_path = self.download_audio(episode_url, temp_dir)
 
-            # Process audio
-            results = self.processor.diarize_audio(audio_path)
+            # Process audio with metadata
+            results = self.processor.diarize_audio(
+                audio_path,
+                episode_url=episode_url,
+                language=language
+            )
 
             # Submit results
             success = self.submit_results(job_id, results)

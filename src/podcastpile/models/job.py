@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Enum as SQLEnum, Index
+from sqlalchemy import Column, Integer, String, DateTime, Text, Enum as SQLEnum, Index, Float
 from datetime import datetime, timedelta
 from enum import Enum
 from .database import Base
@@ -24,10 +24,15 @@ class Job(Base):
     worker_ip = Column(String, nullable=True)
     language = Column(String, nullable=True, index=True)  # Language code (e.g., 'en', 'es', 'fr')
 
-    # Results
-    transcription = Column(Text, nullable=True)
-    diarization = Column(Text, nullable=True)
-    result_json = Column(Text, nullable=True)  # JSON results from worker
+    # Results (Text is unlimited in SQLite/PostgreSQL, use LONGTEXT for MySQL if needed)
+    transcription = Column(Text, nullable=True)  # Full transcription text
+    diarization = Column(Text, nullable=True)  # Diarization timestamps
+    result_json = Column(Text, nullable=True)  # JSON results with all segments
+
+    # Processing metadata
+    processing_duration = Column(Float, nullable=True)  # Seconds to process
+    worker_gpu = Column(String, nullable=True)  # GPU device used (e.g., "NVIDIA RTX 4090")
+    processed_at = Column(DateTime, nullable=True)  # When processing actually finished
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -66,7 +71,16 @@ class Job(Base):
         """Mark job as being processed."""
         self.status = JobStatus.PROCESSING
 
-    def mark_completed(self, transcription: str = None, diarization: str = None, ia_url: str = None, result_json: str = None):
+    def mark_completed(
+        self,
+        transcription: str = None,
+        diarization: str = None,
+        ia_url: str = None,
+        result_json: str = None,
+        processing_duration: float = None,
+        worker_gpu: str = None,
+        processed_at: datetime = None
+    ):
         """Mark job as completed."""
         self.status = JobStatus.COMPLETED
         self.completed_at = datetime.utcnow()
@@ -78,6 +92,12 @@ class Job(Base):
             self.ia_url = ia_url
         if result_json:
             self.result_json = result_json
+        if processing_duration is not None:
+            self.processing_duration = processing_duration
+        if worker_gpu:
+            self.worker_gpu = worker_gpu
+        if processed_at:
+            self.processed_at = processed_at
 
     def mark_failed(self, error_message: str):
         """Mark job as failed."""

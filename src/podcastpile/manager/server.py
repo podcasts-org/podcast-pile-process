@@ -46,6 +46,9 @@ class JobResult(BaseModel):
     diarization: Optional[str] = None
     ia_url: Optional[str] = None
     result_json: Optional[str] = None
+    processing_duration: Optional[float] = None  # Seconds to process
+    worker_gpu: Optional[str] = None  # GPU device info
+    processed_at: Optional[str] = None  # ISO format timestamp
 
 
 class StatsResponse(BaseModel):
@@ -328,11 +331,23 @@ async def complete_job(
     if job.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Job not assigned to this worker")
 
+    # Parse processed_at if provided
+    processed_at = None
+    if result.processed_at:
+        from datetime import datetime
+        try:
+            processed_at = datetime.fromisoformat(result.processed_at.replace('Z', '+00:00'))
+        except Exception:
+            pass  # Ignore if parsing fails
+
     job.mark_completed(
         transcription=result.transcription,
         diarization=result.diarization,
         ia_url=result.ia_url,
-        result_json=result.result_json
+        result_json=result.result_json,
+        processing_duration=result.processing_duration,
+        worker_gpu=result.worker_gpu,
+        processed_at=processed_at
     )
     db.commit()
     return {"status": "completed"}

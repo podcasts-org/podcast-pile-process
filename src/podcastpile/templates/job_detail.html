@@ -219,6 +219,21 @@
                 <div class="info-label">Completed:</div>
                 <div class="info-value">{{ job.completed_at.strftime('%Y-%m-%d %H:%M:%S') if job.completed_at else '-' }}</div>
 
+                {% if job.processed_at %}
+                <div class="info-label">Processed At:</div>
+                <div class="info-value">{{ job.processed_at.strftime('%Y-%m-%d %H:%M:%S') if job.processed_at else '-' }}</div>
+                {% endif %}
+
+                {% if job.processing_duration %}
+                <div class="info-label">Processing Duration:</div>
+                <div class="info-value">{{ "%.2f"|format(job.processing_duration) }} seconds ({{ "%.2f"|format(job.processing_duration / 60) }} minutes)</div>
+                {% endif %}
+
+                {% if job.worker_gpu %}
+                <div class="info-label">GPU Used:</div>
+                <div class="info-value">{{ job.worker_gpu }}</div>
+                {% endif %}
+
                 {% if job.error_message %}
                 <div class="info-label">Error:</div>
                 <div class="info-value" style="color: #e74c3c;">{{ job.error_message }}</div>
