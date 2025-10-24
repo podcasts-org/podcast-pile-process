@@ -18,6 +18,7 @@ class Job(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     episode_url = Column(String, nullable=False)
+    podcast_id = Column(String, nullable=True, index=True)  # External podcast identifier for reference
     status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True)
     worker_id = Column(String, nullable=True, index=True)
     worker_ip = Column(String, nullable=True)

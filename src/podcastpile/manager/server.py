@@ -22,12 +22,14 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 # Pydantic models for API
 class JobCreate(BaseModel):
     episode_url: str
+    podcast_id: Optional[str] = None  # External podcast identifier
     language: Optional[str] = None  # ISO 639-1 language code (e.g., 'en', 'es', 'fr')
 
 
 class JobResponse(BaseModel):
     id: int
     episode_url: str
+    podcast_id: Optional[str]
     status: JobStatus
     worker_id: Optional[str]
     language: Optional[str]

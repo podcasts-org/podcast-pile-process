@@ -72,10 +72,25 @@ def get_existing_urls(session, urls: List[str]) -> set:
     if not urls:
         return set()
 
-    # Use parameterized query for safety
-    query = text("SELECT episode_url FROM jobs WHERE episode_url IN :urls")
-    result = session.execute(query, {"urls": tuple(urls)})
-    return {row[0] for row in result}
+    # SQLAlchemy requires creating individual placeholders for IN clause
+    # For large batches, check in chunks to avoid SQL length limits
+    chunk_size = 500
+    existing = set()
+
+    for i in range(0, len(urls), chunk_size):
+        chunk = urls[i:i + chunk_size]
+
+        # Create placeholders: :url0, :url1, :url2, etc.
+        placeholders = ', '.join(f':url{j}' for j in range(len(chunk)))
+        query = text(f"SELECT episode_url FROM jobs WHERE episode_url IN ({placeholders})")
+
+        # Create parameter dict: {url0: 'http://...', url1: 'http://...', ...}
+        params = {f'url{j}': url for j, url in enumerate(chunk)}
+
+        result = session.execute(query, params)
+        existing.update(row[0] for row in result)
+
+    return existing
 
 
 def bulk_insert_jobs(session, jobs_data: List[Dict], skip_existing: bool = True) -> tuple:
@@ -99,9 +114,11 @@ def bulk_insert_jobs(session, jobs_data: List[Dict], skip_existing: bool = True)
 
         # Parse language
         language = parse_language(item.get('language'))
+        podcast_id = item.get('podcast_id')
 
         records.append({
             'episode_url': episode_url,
+            'podcast_id': podcast_id,
             'language': language,
             'status': JobStatus.PENDING.value,
             'worker_id': None,
@@ -166,8 +183,29 @@ def import_jsonl(
         skip_existing: Skip URLs that already exist
         progress_interval: Report progress every N records
     """
-    # Setup database connection
-    engine = create_engine(config.DATABASE_URL, echo=False)
+    # Setup database connection with optimizations for SQLite
+    connect_args = {}
+    if 'sqlite' in config.DATABASE_URL:
+        # SQLite performance optimizations
+        connect_args = {
+            'check_same_thread': False,
+        }
+
+    engine = create_engine(
+        config.DATABASE_URL,
+        echo=False,
+        connect_args=connect_args
+    )
+
+    # Apply SQLite-specific pragmas for massive speed boost
+    if 'sqlite' in config.DATABASE_URL:
+        with engine.connect() as conn:
+            conn.execute(text("PRAGMA journal_mode = WAL"))  # Write-Ahead Logging
+            conn.execute(text("PRAGMA synchronous = NORMAL"))  # Faster than FULL
+            conn.execute(text("PRAGMA cache_size = -64000"))  # 64MB cache
+            conn.execute(text("PRAGMA temp_store = MEMORY"))  # Use memory for temp
+            conn.commit()
+
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
 
@@ -180,10 +218,16 @@ def import_jsonl(
     print(f"Starting import from {filepath}")
     print(f"Batch size: {batch_size}")
     print(f"Skip existing: {skip_existing}")
+    if not skip_existing:
+        print("⚡ FAST MODE: Duplicate checking disabled")
     print("-" * 60)
 
     try:
         session = Session()
+
+        # For fresh imports, use single transaction for max speed
+        if not skip_existing and 'sqlite' in config.DATABASE_URL:
+            session.execute(text("BEGIN"))
 
         for batch in read_jsonl_batched(filepath, batch_size):
             inserted, skipped = bulk_insert_jobs(session, batch, skip_existing)
