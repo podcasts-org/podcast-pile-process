@@ -131,15 +131,17 @@ class AudioProcessor:
                 from fireredasr.models.fireredasr import FireRedAsr
                 from huggingface_hub import snapshot_download
 
-                # Download model from HuggingFace if not cached
+                # Download model from HuggingFace to local directory
+                model_dir = "./pretrained_models/FireRedASR-AED-L"
                 logger.info("Downloading/loading FireRedASR-AED-L from HuggingFace...")
-                model_path = snapshot_download(
+                snapshot_download(
                     repo_id="FireRedTeam/FireRedASR-AED-L",
-                    cache_dir="./pretrained_models"
+                    local_dir=model_dir,
+                    local_dir_use_symlinks=False
                 )
 
-                # Use AED variant for better accuracy
-                self.zh_asr_model = FireRedAsr.from_pretrained("aed", model_path)
+                # Load the model
+                self.zh_asr_model = FireRedAsr.from_pretrained("aed", model_dir)
                 logger.info("✓ FireRedASR model loaded")
             except ImportError as e:
                 logger.error(f"Failed to import FireRedASR: {e}")
