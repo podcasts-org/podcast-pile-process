@@ -14,9 +14,26 @@ In the background, the manager submits URLs to the Internet Archive's Save Page 
 
 ## Installation
 
+### Manager Server
+
+For running the manager server only (no worker):
+
 ```bash
 pip install -e .
 ```
+
+### Worker
+
+For running a worker, you need additional ML dependencies:
+
+```bash
+pip install -e ".[worker]"
+```
+
+This will install:
+- librosa (audio processing)
+- soundfile (audio I/O)
+- nemo_toolkit[asr] (NeMo ASR models)
 
 Or using requirements.txt:
 
@@ -60,24 +77,60 @@ Options:
 
 The admin dashboard will be available at `http://localhost:8000`
 
-### Worker (Coming Soon)
+### Worker
 
-Worker functionality is planned but not yet implemented. When ready, workers will:
-- Download episodes from URLs
-- Perform diarization using Nvidia NeMo
-- Transcribe audio using Parakeet
-- Submit results back to manager
+Start a worker to process jobs:
 
 ```bash
-ppcli worker -m http://<manager-host>:8000
+# Basic usage (processes English jobs only by default)
+ppcli worker -m http://localhost:8000
+
+# With worker ID and password
+ppcli worker -m http://localhost:8000 -i my-worker -p worker-password
+
+# Process multiple languages
+ppcli worker -m http://localhost:8000 -l en,es,fr
+
+# Use custom diarization configuration
+ppcli worker -m http://localhost:8000 -c low_latency
+
+# Process one job and exit
+ppcli worker -m http://localhost:8000 --once
+
+# Verbose logging
+ppcli worker -m http://localhost:8000 -v
 ```
+
+Worker Options:
+- `-m, --manager`: Manager URL (required)
+- `-i, --worker-id`: Worker ID (default: hostname)
+- `-p, --password`: Worker password (can also use WORKER_PASSWORD env var)
+- `-l, --languages`: Comma-separated language codes to process (default: en)
+- `-c, --config`: Diarization configuration - `very_high_latency`, `high_latency` (default), `low_latency`, `ultra_low_latency`
+- `--model`: Path to custom .nemo model file
+- `--once`: Process one job and exit
+- `--poll-interval`: Seconds between polling for jobs (default: 10)
+- `-v, --verbose`: Enable verbose logging
+
+The worker will:
+1. Load NeMo diarization and ASR models (this takes a while on first run)
+2. Request jobs from the manager (filtered by language)
+3. Download the audio file
+4. Perform diarization and transcription
+5. Compute SHA256 and MD5 hashes of the audio file
+6. Upload results (JSON, transcription, diarization) back to the manager
+7. Repeat continuously (unless `--once` is used)
 
 ## CLI Commands
 
 ### Create a job
 
 ```bash
+# Create a job with an episode URL
 ppcli create https://example.com/podcast.mp3
+
+# Create a job with language tag
+ppcli create https://example.com/spanish-podcast.mp3 --language es
 ```
 
 ### List jobs
