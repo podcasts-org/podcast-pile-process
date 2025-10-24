@@ -63,6 +63,9 @@ db.sqlite3-journal
 
 # Podcast Pile database
 podcastpile.db
+podcastpile.db-journal
+podcastpile.db-shm
+podcastpile.db-wal
 
 # Flask stuff:
 instance/

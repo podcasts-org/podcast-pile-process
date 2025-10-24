@@ -94,8 +94,11 @@ async def dashboard(
         "expired": stats_dict.get(JobStatus.EXPIRED.value, 0),
     }
 
-    # Get recent jobs (limit to 20, uses index: created_at)
-    recent_jobs = db.query(Job).order_by(Job.created_at.desc()).limit(20).all()
+    # Get recent jobs (limit to 20, processing jobs first)
+    recent_jobs = db.query(Job).order_by(
+        (Job.status == JobStatus.PROCESSING).desc(),
+        Job.created_at.desc()
+    ).limit(20).all()
 
     # Get active workers count efficiently (uses index: ix_worker_status)
     active_worker_count = db.query(Job.worker_id).filter(
