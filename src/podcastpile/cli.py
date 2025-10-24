@@ -36,13 +36,14 @@ def manager(port, host, reload):
               default='high_latency',
               help='Diarization configuration (default: high_latency)')
 @click.option('--model', help='Path to custom .nemo model file')
+@click.option('--batch-size', default=4, type=int, help='Batch size for FireRedASR transcription (1, 2, 4, 8, 16, etc.) Default: 4')
 @click.option('--once', is_flag=True, help='Process one job and exit')
 @click.option('--poll-interval', default=10, type=int, help='Seconds between polling for jobs (default: 10)')
 @click.option('--gpu', type=int, help='GPU device ID to use (e.g., 0, 1, 2)')
 @click.option('--all-gpus', is_flag=True, help='Spawn a worker on each available GPU')
 @click.option('--gpus', help='Comma-separated list of GPU IDs to use (e.g., "0,1,3")')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose logging')
-def worker(manager, worker_id, password, languages, config, model, once, poll_interval, gpu, all_gpus, gpus, verbose):
+def worker(manager, worker_id, password, languages, config, model, batch_size, once, poll_interval, gpu, all_gpus, gpus, verbose):
     """Run a worker to process jobs."""
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -76,8 +77,13 @@ def worker(manager, worker_id, password, languages, config, model, once, poll_in
         gpu_list = [gpu]
         click.echo(f"Using GPU {gpu}")
     else:
-        # Single worker, no specific GPU
-        gpu_list = [None]
+        # Auto-detect available GPUs and spawn worker for each
+        gpu_list = get_available_gpus()
+        if not gpu_list:
+            click.echo("No GPUs detected, running in CPU mode", err=True)
+            gpu_list = [None]
+        else:
+            click.echo(f"Auto-detected GPUs: {gpu_list}")
 
     # Multi-GPU mode - spawn multiple workers
     if len(gpu_list) > 1:
@@ -106,7 +112,7 @@ def worker(manager, worker_id, password, languages, config, model, once, poll_in
             wid = f"{base_worker_id}-gpu{gpu_id}"
             p = multiprocessing.Process(
                 target=_run_single_worker,
-                args=(manager, wid, password, languages, config, model, once, poll_interval, gpu_id, verbose)
+                args=(manager, wid, password, languages, config, model, batch_size, once, poll_interval, gpu_id, verbose)
             )
             p.start()
             processes.append(p)
@@ -124,10 +130,10 @@ def worker(manager, worker_id, password, languages, config, model, once, poll_in
         if not worker_id:
             worker_id = f"{socket.gethostname()}-gpu{gpu_id}" if gpu_id is not None else socket.gethostname()
 
-        _run_single_worker(manager, worker_id, password, languages, config, model, once, poll_interval, gpu_id, verbose)
+        _run_single_worker(manager, worker_id, password, languages, config, model, batch_size, once, poll_interval, gpu_id, verbose)
 
 
-def _run_single_worker(manager, worker_id, password, languages, config, model, once, poll_interval, gpu_id, verbose):
+def _run_single_worker(manager, worker_id, password, languages, config, model, batch_size, once, poll_interval, gpu_id, verbose):
     """Run a single worker instance"""
     import logging
     import click
@@ -146,6 +152,7 @@ def _run_single_worker(manager, worker_id, password, languages, config, model, o
     click.echo(f"  Manager: {manager}")
     click.echo(f"  Languages: {languages}")
     click.echo(f"  Config: {config}")
+    click.echo(f"  Batch size: {batch_size}")
     click.echo(f"  GPU: {gpu_id if gpu_id is not None else 'auto'}")
     click.echo(f"  Mode: {'Single job' if once else 'Continuous'}")
     click.echo()
@@ -159,7 +166,8 @@ def _run_single_worker(manager, worker_id, password, languages, config, model, o
             config=config,
             model_path=model,
             gpu_id=gpu_id,
-            languages=languages
+            languages=languages,
+            batch_size=batch_size
         )
     except Exception as e:
         click.echo(f"Error creating worker: {e}", err=True)

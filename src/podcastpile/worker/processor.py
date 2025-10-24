@@ -48,7 +48,7 @@ def get_available_gpus() -> list:
 class AudioProcessor:
     """Handles audio processing and diarization"""
 
-    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None, languages: str = "en"):
+    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None, languages: str = "en", batch_size: int = 4):
         """
         Initialize audio processor with models
 
@@ -57,10 +57,12 @@ class AudioProcessor:
             model_path: Optional path to custom .nemo model file
             gpu_id: GPU device ID to use (None for auto-select)
             languages: Comma-separated language codes to determine which models to load
+            batch_size: Batch size for FireRedASR transcription (1, 2, 4, 8, 16, etc.) Default: 4
         """
         self.config_name = config
         self.gpu_id = gpu_id
         self.languages = [lang.strip().lower() for lang in languages.split(',')]
+        self.batch_size = batch_size
         self.configs = {
             "very_high_latency": {
                 "CHUNK_SIZE": 340, "RIGHT_CONTEXT": 40, "FIFO_SIZE": 40,
@@ -97,19 +99,29 @@ class AudioProcessor:
                 logger.warning(f"Could not set GPU {self.gpu_id}: {e}")
 
         logger.info("Loading diarization model...")
+
+        # Determine map location for model loading
+        if self.gpu_id is not None:
+            map_location = f'cuda:{self.gpu_id}'
+        else:
+            map_location = 'cpu'
+
         if self.model_path and os.path.exists(self.model_path):
             self.diar_model = SortformerEncLabelModel.restore_from(
                 restore_path=self.model_path,
-                map_location='cuda',
+                map_location=map_location,
                 strict=False
             )
         else:
             self.diar_model = SortformerEncLabelModel.from_pretrained(
                 "nvidia/diar_streaming_sortformer_4spk-v2"
             )
+            # Move to correct GPU if specified
+            if self.gpu_id is not None:
+                self.diar_model = self.diar_model.to(map_location)
 
         self.diar_model.eval()
-        logger.info("✓ Diarization model loaded")
+        logger.info(f"✓ Diarization model loaded on {map_location}")
 
         # Determine which ASR models to load based on languages
         needs_chinese = 'zh' in self.languages or 'cn' in self.languages
@@ -121,34 +133,35 @@ class AudioProcessor:
             self.asr_model = nemo_asr.models.ASRModel.from_pretrained(
                 model_name="nvidia/parakeet-tdt-0.6b-v3"
             )
+            # Move to correct GPU if specified
+            if self.gpu_id is not None:
+                self.asr_model = self.asr_model.to(f'cuda:{self.gpu_id}')
             self.asr_model.eval()
-            logger.info("✓ Parakeet ASR model loaded")
+            logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
 
-        # Load FireRedASR (Chinese) if needed
+        # Load Paraformer (Chinese) if needed
         if needs_chinese:
-            logger.info("Loading FireRedASR model (Chinese)...")
+            logger.info("Loading Paraformer model (Chinese)...")
             try:
-                from fireredasr.models.fireredasr import FireRedAsr
-                from huggingface_hub import snapshot_download
+                from funasr import AutoModel
 
-                # Download model from HuggingFace to local directory
-                model_dir = "./pretrained_models/FireRedASR-AED-L"
-                logger.info("Downloading/loading FireRedASR-AED-L from HuggingFace...")
-                snapshot_download(
-                    repo_id="FireRedTeam/FireRedASR-AED-L",
-                    local_dir=model_dir,
-                    local_dir_use_symlinks=False
+                self.zh_asr_model = AutoModel(
+                    model="paraformer-zh",
+                    model_revision="v2.0.4",
+                    vad_model="fsmn-vad",
+                    vad_model_revision="v2.0.4",
+                    punc_model="ct-punc-c",
+                    punc_model_revision="v2.0.4",
+                    hub="hf",
+                    device=f"cuda:{self.gpu_id}" if self.gpu_id is not None else "cpu"
                 )
-
-                # Load the model
-                self.zh_asr_model = FireRedAsr.from_pretrained("aed", model_dir)
-                logger.info("✓ FireRedASR model loaded")
+                logger.info(f"✓ Paraformer model loaded on {map_location}")
             except ImportError as e:
-                logger.error(f"Failed to import FireRedASR: {e}")
-                logger.error("Install with: pip install fireredasr huggingface-hub")
+                logger.error(f"Failed to import FunASR: {e}")
+                logger.error("Install with: pip install funasr")
                 raise
             except Exception as e:
-                logger.error(f"Failed to load FireRedASR model: {e}")
+                logger.error(f"Failed to load Paraformer model: {e}")
                 raise
 
         # Set streaming configuration
@@ -263,28 +276,24 @@ class AudioProcessor:
 
             logger.info(f"Transcribing {len(temp_files)} segments...")
             if is_chinese and self.zh_asr_model:
-                # Use FireRedASR for Chinese
-                logger.info("Using FireRedASR for Chinese transcription")
+                # Use Paraformer for Chinese (batch_size=1 with progress bar)
+                logger.info("Using Paraformer for Chinese transcription")
 
-                # Create batch inputs for FireRedASR
-                batch_uttid = [f"segment_{i}" for i in range(len(temp_files))]
+                from tqdm import tqdm
 
-                results_zh = self.zh_asr_model.transcribe(
-                    batch_uttid,
-                    temp_files,
-                    {
-                        "use_gpu": 1 if self.gpu_id is not None else 0,
-                        "beam_size": 3,
-                        "nbest": 1,
-                        "decode_max_len": 0,
-                        "softmax_smoothing": 1.0,
-                        "aed_length_penalty": 0.0,
-                        "eos_penalty": 1.0
-                    }
-                )
+                transcriptions = []
+                # Process one file at a time with progress bar
+                for temp_file in tqdm(temp_files, desc="Transcribing segments", unit="segment", dynamic_ncols=True):
+                    results = self.zh_asr_model.generate(
+                        input=temp_file,
+                        batch_size_s=300
+                    )
 
-                # Extract transcriptions from FireRedASR results
-                transcriptions = [results_zh[uttid][0]['text'] for uttid in batch_uttid]
+                    # Extract text from result - format is [{'key': 'filename', 'text': 'transcription'}]
+                    if results and len(results) > 0 and isinstance(results[0], dict):
+                        transcriptions.append(results[0].get('text', ''))
+                    else:
+                        transcriptions.append('')
 
             elif self.asr_model:
                 # Use Parakeet for English/other languages
@@ -345,7 +354,8 @@ class PodcastPileWorker:
         config: str = "high_latency",
         model_path: Optional[str] = None,
         gpu_id: Optional[int] = None,
-        languages: str = "en"
+        languages: str = "en",
+        batch_size: int = 4
     ):
         """
         Initialize worker
@@ -358,12 +368,13 @@ class PodcastPileWorker:
             model_path: Optional path to custom .nemo model file
             gpu_id: GPU device ID to use (None for auto-select)
             languages: Comma-separated language codes worker will process
+            batch_size: Batch size for FireRedASR transcription (default: 4)
         """
         self.manager_url = manager_url.rstrip('/')
         self.worker_id = worker_id
         self.worker_password = worker_password
         self.gpu_id = gpu_id
-        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id, languages=languages)
+        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id, languages=languages, batch_size=batch_size)
 
         # Headers for API requests
         self.headers = {}

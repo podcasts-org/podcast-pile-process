@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Job #{{ job.id }} - Podcast Pile</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@alenaksu/json-viewer@2.0.0/dist/json-viewer.min.css">
     <style>
         * {
             margin: 0;
@@ -100,24 +99,9 @@
             color: #3498db;
         }
 
-        .json-viewer-container {
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 4px;
-            padding: 15px;
-            max-height: 600px;
-            overflow: auto;
-        }
-
         .no-data {
             color: #999;
             font-style: italic;
-        }
-
-        json-viewer {
-            --font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
-            --font-size: 14px;
-            --line-height: 1.5;
         }
 
         .text-result {
@@ -255,10 +239,8 @@
 
         {% if job.result_json %}
         <div class="card">
-            <h2>Result Data (Interactive JSON Viewer)</h2>
-            <div class="json-viewer-container">
-                <json-viewer id="json-viewer"></json-viewer>
-            </div>
+            <h2>Result Data (JSON)</h2>
+            <div class="text-result">{{ job.result_json|tojson(indent=2) }}</div>
         </div>
         {% endif %}
 
@@ -323,20 +305,5 @@
         }
     </script>
 
-    <script type="module">
-        import JsonViewer from 'https://cdn.jsdelivr.net/npm/@alenaksu/json-viewer@2.0.0/dist/json-viewer.bundle.js';
-
-        {% if job.result_json %}
-        try {
-            const jsonData = {{ job.result_json|safe }};
-            const viewer = document.getElementById('json-viewer');
-            viewer.data = jsonData;
-            viewer.expanded = true;
-        } catch (error) {
-            document.getElementById('json-viewer').innerHTML =
-                '<p style="color: #e74c3c;">Error parsing JSON: ' + error.message + '</p>';
-        }
-        {% endif %}
-    </script>
 </body>
 </html>

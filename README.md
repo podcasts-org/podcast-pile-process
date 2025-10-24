@@ -35,10 +35,10 @@ This will install:
 
 **For Chinese language support**, also install:
 ```bash
-pip install fireredasr huggingface-hub
+pip install funasr
 ```
 
-The FireRedASR model will be automatically downloaded from HuggingFace on first use.
+The Paraformer model will be automatically downloaded from HuggingFace on first use.
 
 Or using requirements.txt:
 
@@ -113,6 +113,9 @@ ppcli worker -m http://localhost:8000 --all-gpus
 
 # Multi-GPU - Use specific GPUs (e.g., 0, 1, and 3)
 ppcli worker -m http://localhost:8000 --gpus 0,1,3
+
+# Chinese transcription with custom batch size
+ppcli worker -m http://localhost:8000 -l zh --batch-size 8
 ```
 
 Worker Options:
@@ -122,6 +125,7 @@ Worker Options:
 - `-l, --languages`: Comma-separated language codes to process (default: en)
 - `-c, --config`: Diarization configuration - `very_high_latency`, `high_latency` (default), `low_latency`, `ultra_low_latency`
 - `--model`: Path to custom .nemo model file
+- `--batch-size`: Batch size for FireRedASR transcription (1, 2, 4, 8, 16, etc.) Default: 4
 - `--gpu`: GPU device ID to use (e.g., 0, 1, 2)
 - `--all-gpus`: Spawn a worker process on each available GPU
 - `--gpus`: Comma-separated list of GPU IDs to use (e.g., "0,1,3")
@@ -132,8 +136,8 @@ Worker Options:
 The worker will:
 1. **Load models once at startup** - Models are loaded based on selected languages:
    - **English/other**: Parakeet TDT (NeMo ASR)
-   - **Chinese (zh)**: FireRedASR-AED-L
-   - If languages contain `zh` or `cn`, FireRedASR is loaded
+   - **Chinese (zh)**: Paraformer (FunASR) with VAD and punctuation
+   - If languages contain `zh` or `cn`, Paraformer is loaded
    - If languages contain non-Chinese codes, Parakeet is loaded
 2. Request jobs from the manager (filtered by language)
 3. Download the audio file
