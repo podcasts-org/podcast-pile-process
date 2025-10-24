@@ -28,7 +28,6 @@ class JobCreate(BaseModel):
 class JobResponse(BaseModel):
     id: int
     episode_url: str
-    ia_url: Optional[str]
     status: JobStatus
     worker_id: Optional[str]
     language: Optional[str]
@@ -44,7 +43,6 @@ class JobResponse(BaseModel):
 class JobResult(BaseModel):
     transcription: Optional[str] = None
     diarization: Optional[str] = None
-    ia_url: Optional[str] = None
     result_json: Optional[str] = None
     processing_duration: Optional[float] = None  # Seconds to process
     worker_gpu: Optional[str] = None  # GPU device info
@@ -343,7 +341,6 @@ async def complete_job(
     job.mark_completed(
         transcription=result.transcription,
         diarization=result.diarization,
-        ia_url=result.ia_url,
         result_json=result.result_json,
         processing_duration=result.processing_duration,
         worker_gpu=result.worker_gpu,

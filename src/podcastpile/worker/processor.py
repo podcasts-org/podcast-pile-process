@@ -420,6 +420,10 @@ class PodcastPileWorker:
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Error submitting results: {e}")
+            try:
+                logger.error(f"Response body: {e.response.text if e.response else 'N/A'}")
+            except:
+                pass
             return False
 
     def report_failure(self, job_id: int, error_message: str) -> bool:

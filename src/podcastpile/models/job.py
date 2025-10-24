@@ -18,7 +18,6 @@ class Job(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     episode_url = Column(String, nullable=False)
-    ia_url = Column(String, nullable=True)
     status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True)
     worker_id = Column(String, nullable=True, index=True)
     worker_ip = Column(String, nullable=True)
@@ -75,7 +74,6 @@ class Job(Base):
         self,
         transcription: str = None,
         diarization: str = None,
-        ia_url: str = None,
         result_json: str = None,
         processing_duration: float = None,
         worker_gpu: str = None,
@@ -88,8 +86,6 @@ class Job(Base):
             self.transcription = transcription
         if diarization:
             self.diarization = diarization
-        if ia_url:
-            self.ia_url = ia_url
         if result_json:
             self.result_json = result_json
         if processing_duration is not None:

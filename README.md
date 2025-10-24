@@ -4,13 +4,11 @@ Data processing infra for Podcast Pile.
 
 ## Architecture
 
-The manager server maintains a queue of episodes to process. Worker servers request jobs from the manager, which assigns them tasks. Workers then process their assigned jobs and return results (transcription, diarization, Internet Archive URL, etc.) to the manager, which stores them in the database.
+The manager server maintains a queue of episodes to process. Worker servers request jobs from the manager, which assigns them tasks. Workers then process their assigned jobs and return results (transcription, diarization, and metadata) to the manager, which stores them in the database.
 
 Jobs automatically expire after 2 hours if not completed. The manager tracks worker IP addresses and worker IDs for each job.
 
-Workers download episodes from their remote URLs, perform diarization using Nvidia NeMo, transcribe audio using Parakeet, and send the results back to the manager.
-
-In the background, the manager submits URLs to the Internet Archive's Save Page Now API for archival. The manager only serves URLs from the Internet Archive rather than direct episode URLs (to avoid timestamp issues with dynamic ads).
+Workers download episodes from their URLs, perform diarization using Nvidia NeMo, transcribe audio using Parakeet, and send the results back to the manager.
 
 ## Installation
 
