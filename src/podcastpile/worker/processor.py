@@ -17,6 +17,8 @@ import librosa
 import soundfile as sf
 from nemo.collections.asr.models import SortformerEncLabelModel
 import nemo.collections.asr as nemo_asr
+import numpy as np
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -325,12 +327,13 @@ class AudioProcessor:
                 if i < 3:  # Log first 3 for debugging
                     logger.debug(f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'...")
 
-            # BGM classification for each segment
+            # BGM classification for all segments (batched)
             logger.info(f"Classifying BGM for {len(temp_files)} segments...")
-            import numpy as np
-            for i, temp_file in enumerate(temp_files):
+
+            # Load all segment audio files
+            audio_inputs = []
+            for temp_file in temp_files:
                 try:
-                    # Load segment audio
                     segment_audio, segment_sr = librosa.load(temp_file, sr=16000, mono=True)
 
                     # Normalize to float32
@@ -339,13 +342,22 @@ class AudioProcessor:
                     elif segment_audio.dtype == np.int32:
                         segment_audio = segment_audio.astype(np.float32) / 2147483648.0
 
-                    # Classify using pipeline
-                    predictions = self.bgm_classifier({
-                        "array": segment_audio,
-                        "sampling_rate": segment_sr
-                    })
+                    audio_inputs.append({"array": segment_audio, "sampling_rate": segment_sr})
+                except Exception as e:
+                    logger.warning(f"Failed to load audio for BGM classification: {e}")
+                    audio_inputs.append(None)
 
-                    # Extract BGM probability (predictions is list of dicts: [{'label': 'bgm', 'score': 0.9}, ...])
+            # Batch classify with progress bar
+            for i in tqdm(range(len(audio_inputs)), desc="Classifying BGM", unit="segment", dynamic_ncols=True):
+                try:
+                    if audio_inputs[i] is None:
+                        results[i]["bgm_probability"] = 0.0
+                        results[i]["bgm"] = False
+                        continue
+
+                    predictions = self.bgm_classifier(audio_inputs[i])
+
+                    # Extract BGM probability
                     bgm_prob = 0.0
                     for pred in predictions:
                         if pred['label'] == 'bgm':
