@@ -1,6 +1,10 @@
-from sqlalchemy import Column, Integer, String, DateTime, Text, Enum as SQLEnum, Index, Float
 from datetime import datetime, timedelta
 from enum import Enum
+
+from sqlalchemy import Column, DateTime
+from sqlalchemy import Enum as SQLEnum
+from sqlalchemy import Float, Index, Integer, String, Text
+
 from .database import Base
 
 
@@ -18,11 +22,17 @@ class Job(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     episode_url = Column(String, nullable=False)
-    podcast_id = Column(String, nullable=True, index=True)  # External podcast identifier for reference
-    status = Column(SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True)
+    podcast_id = Column(
+        String, nullable=True, index=True
+    )  # External podcast identifier for reference
+    status = Column(
+        SQLEnum(JobStatus), default=JobStatus.PENDING, nullable=False, index=True
+    )
     worker_id = Column(String, nullable=True, index=True)
     worker_ip = Column(String, nullable=True)
-    language = Column(String, nullable=True, index=True)  # Language code (e.g., 'en', 'es', 'fr')
+    language = Column(
+        String, nullable=True, index=True
+    )  # Language code (e.g., 'en', 'es', 'fr')
 
     # Results (Text is unlimited in SQLite/PostgreSQL, use LONGTEXT for MySQL if needed)
     transcription = Column(Text, nullable=True)  # Full transcription text
@@ -31,7 +41,9 @@ class Job(Base):
 
     # Processing metadata
     processing_duration = Column(Float, nullable=True)  # Seconds to process
-    worker_gpu = Column(String, nullable=True)  # GPU device used (e.g., "NVIDIA RTX 4090")
+    worker_gpu = Column(
+        String, nullable=True
+    )  # GPU device used (e.g., "NVIDIA RTX 4090")
     processed_at = Column(DateTime, nullable=True)  # When processing actually finished
 
     # Timestamps
@@ -42,11 +54,13 @@ class Job(Base):
 
     # Composite indexes for common queries
     __table_args__ = (
-        Index('ix_status_created', 'status', 'created_at'),
-        Index('ix_status_completed', 'status', 'completed_at'),
-        Index('ix_status_expires', 'status', 'expires_at'),
-        Index('ix_worker_status', 'worker_id', 'status'),
-        Index('ix_status_language', 'status', 'language'),  # For language-filtered worker queries
+        Index("ix_status_created", "status", "created_at"),
+        Index("ix_status_completed", "status", "completed_at"),
+        Index("ix_status_expires", "status", "expires_at"),
+        Index("ix_worker_status", "worker_id", "status"),
+        Index(
+            "ix_status_language", "status", "language"
+        ),  # For language-filtered worker queries
     )
 
     # Error tracking
@@ -78,7 +92,7 @@ class Job(Base):
         result_json: str = None,
         processing_duration: float = None,
         worker_gpu: str = None,
-        processed_at: datetime = None
+        processed_at: datetime = None,
     ):
         """Mark job as completed."""
         self.status = JobStatus.COMPLETED

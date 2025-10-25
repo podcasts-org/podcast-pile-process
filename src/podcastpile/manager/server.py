@@ -1,16 +1,17 @@
-from fastapi import FastAPI, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
-from sqlalchemy.orm import Session
-from sqlalchemy import func
+import os
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel
-import os
 
-from ..models import get_db, Job, JobStatus, init_db
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
 from ..config import config
-from .auth import verify_worker_auth, verify_admin_auth, get_client_ip
+from ..models import Job, JobStatus, get_db, init_db
+from .auth import get_client_ip, verify_admin_auth, verify_worker_auth
 
 app = FastAPI(title="Podcast Pile Manager", version="0.1.0")
 
@@ -70,17 +71,16 @@ async def startup_event():
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(
-    request: Request,
-    db: Session = Depends(get_db),
-    _: str = Depends(verify_admin_auth)
+    request: Request, db: Session = Depends(get_db), _: str = Depends(verify_admin_auth)
 ):
     """Render admin dashboard (optimized for large datasets)."""
     # Get statistics with single grouped query instead of 7 separate queries
     # Uses index: status
-    status_counts = db.query(
-        Job.status,
-        func.count(Job.id).label('count')
-    ).group_by(Job.status).all()
+    status_counts = (
+        db.query(Job.status, func.count(Job.id).label("count"))
+        .group_by(Job.status)
+        .all()
+    )
 
     stats_dict = {status.value: count for status, count in status_counts}
 
@@ -95,16 +95,23 @@ async def dashboard(
     }
 
     # Get recent jobs (limit to 20, processing jobs first)
-    recent_jobs = db.query(Job).order_by(
-        (Job.status == JobStatus.PROCESSING).desc(),
-        Job.created_at.desc()
-    ).limit(20).all()
+    recent_jobs = (
+        db.query(Job)
+        .order_by((Job.status == JobStatus.PROCESSING).desc(), Job.created_at.desc())
+        .limit(20)
+        .all()
+    )
 
     # Get active workers count efficiently (uses index: ix_worker_status)
-    active_worker_count = db.query(Job.worker_id).filter(
-        Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
-        Job.worker_id.isnot(None)
-    ).distinct().count()
+    active_worker_count = (
+        db.query(Job.worker_id)
+        .filter(
+            Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
+            Job.worker_id.isnot(None),
+        )
+        .distinct()
+        .count()
+    )
 
     return templates.TemplateResponse(
         "dashboard.html",
@@ -113,7 +120,7 @@ async def dashboard(
             "stats": stats,
             "recent_jobs": recent_jobs,
             "active_workers": active_worker_count,
-        }
+        },
     )
 
 
@@ -121,10 +128,11 @@ async def dashboard(
 async def get_stats(db: Session = Depends(get_db)):
     """Get job statistics (optimized for large datasets)."""
     # Single grouped query instead of 7 separate queries
-    status_counts = db.query(
-        Job.status,
-        func.count(Job.id).label('count')
-    ).group_by(Job.status).all()
+    status_counts = (
+        db.query(Job.status, func.count(Job.id).label("count"))
+        .group_by(Job.status)
+        .all()
+    )
 
     stats_dict = {status.value: count for status, count in status_counts}
 
@@ -155,7 +163,7 @@ async def get_jobs_paginated_api(
     per_page: int = 50,
     status_filter: Optional[str] = None,
     db: Session = Depends(get_db),
-    _: str = Depends(verify_admin_auth)
+    _: str = Depends(verify_admin_auth),
 ):
     """Get paginated jobs list (optimized for millions of jobs)."""
     # Validate pagination parameters
@@ -190,8 +198,10 @@ async def get_jobs_paginated_api(
                 "worker_ip": job.worker_ip,
                 "language": job.language,
                 "created_at": job.created_at.isoformat() if job.created_at else None,
-                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-                "has_json": job.result_json is not None
+                "completed_at": (
+                    job.completed_at.isoformat() if job.completed_at else None
+                ),
+                "has_json": job.result_json is not None,
             }
             for job in jobs
         ],
@@ -201,16 +211,14 @@ async def get_jobs_paginated_api(
             "total": total,
             "total_pages": total_pages,
             "has_prev": page > 1,
-            "has_next": page < total_pages
-        }
+            "has_next": page < total_pages,
+        },
     }
 
 
 @app.get("/api/jobs", response_model=List[JobResponse])
 async def list_jobs(
-    status: Optional[JobStatus] = None,
-    limit: int = 100,
-    db: Session = Depends(get_db)
+    status: Optional[JobStatus] = None, limit: int = 100, db: Session = Depends(get_db)
 ):
     """List jobs with optional status filter."""
     query = db.query(Job)
@@ -233,9 +241,11 @@ async def get_job(job_id: int, db: Session = Depends(get_db)):
 async def request_job(
     request: Request,
     worker_id: str,
-    languages: Optional[str] = None,  # Comma-separated language codes (e.g., "en,es,fr")
+    languages: Optional[
+        str
+    ] = None,  # Comma-separated language codes (e.g., "en,es,fr")
     db: Session = Depends(get_db),
-    _: bool = Depends(verify_worker_auth)
+    _: bool = Depends(verify_worker_auth),
 ):
     """Worker requests a job to process.
 
@@ -246,10 +256,14 @@ async def request_job(
                   Example: "en" or "en,es,fr"
     """
     # Expire old jobs first
-    expired_jobs = db.query(Job).filter(
-        Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
-        Job.expires_at < datetime.utcnow()
-    ).all()
+    expired_jobs = (
+        db.query(Job)
+        .filter(
+            Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
+            Job.expires_at < datetime.utcnow(),
+        )
+        .all()
+    )
 
     for job in expired_jobs:
         job.status = JobStatus.EXPIRED
@@ -261,7 +275,7 @@ async def request_job(
 
     # Apply language filter if worker specified languages
     if languages:
-        language_list = [lang.strip() for lang in languages.split(',')]
+        language_list = [lang.strip() for lang in languages.split(",")]
         # Match jobs with specified languages OR jobs with no language set (NULL)
         # Uses index: ix_status_language
         query = query.filter(
@@ -274,8 +288,7 @@ async def request_job(
     if not job:
         if languages:
             raise HTTPException(
-                status_code=404,
-                detail=f"No jobs available for languages: {languages}"
+                status_code=404, detail=f"No jobs available for languages: {languages}"
             )
         raise HTTPException(status_code=404, detail="No jobs available")
 
@@ -289,7 +302,7 @@ async def request_job(
         "job_id": job.id,
         "episode_url": job.episode_url,
         "language": job.language,
-        "expires_at": job.expires_at
+        "expires_at": job.expires_at,
     }
 
 
@@ -298,7 +311,7 @@ async def start_job(
     job_id: int,
     worker_id: str,
     db: Session = Depends(get_db),
-    _: bool = Depends(verify_worker_auth)
+    _: bool = Depends(verify_worker_auth),
 ):
     """Worker marks job as processing."""
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -324,7 +337,7 @@ async def complete_job(
     worker_id: str,
     result: JobResult,
     db: Session = Depends(get_db),
-    _: bool = Depends(verify_worker_auth)
+    _: bool = Depends(verify_worker_auth),
 ):
     """Worker submits completed job results."""
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -338,8 +351,11 @@ async def complete_job(
     processed_at = None
     if result.processed_at:
         from datetime import datetime
+
         try:
-            processed_at = datetime.fromisoformat(result.processed_at.replace('Z', '+00:00'))
+            processed_at = datetime.fromisoformat(
+                result.processed_at.replace("Z", "+00:00")
+            )
         except Exception:
             pass  # Ignore if parsing fails
 
@@ -349,7 +365,7 @@ async def complete_job(
         result_json=result.result_json,
         processing_duration=result.processing_duration,
         worker_gpu=result.worker_gpu,
-        processed_at=processed_at
+        processed_at=processed_at,
     )
     db.commit()
     return {"status": "completed"}
@@ -361,7 +377,7 @@ async def fail_job(
     worker_id: str,
     error_message: str,
     db: Session = Depends(get_db),
-    _: bool = Depends(verify_worker_auth)
+    _: bool = Depends(verify_worker_auth),
 ):
     """Worker reports job failure."""
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -378,8 +394,7 @@ async def fail_job(
 
 @app.get("/api/charts/data")
 async def get_chart_data(
-    db: Session = Depends(get_db),
-    _: str = Depends(verify_admin_auth)
+    db: Session = Depends(get_db), _: str = Depends(verify_admin_auth)
 ):
     """Get data for dashboard charts (optimized for large datasets)."""
     from datetime import timedelta
@@ -389,10 +404,11 @@ async def get_chart_data(
 
     # Throughput: jobs completed per hour (only query completed_at, not full rows)
     # Uses index: ix_status_completed
-    completed_jobs = db.query(Job.completed_at).filter(
-        Job.status == JobStatus.COMPLETED,
-        Job.completed_at >= last_24h
-    ).all()
+    completed_jobs = (
+        db.query(Job.completed_at)
+        .filter(Job.status == JobStatus.COMPLETED, Job.completed_at >= last_24h)
+        .all()
+    )
 
     # Group by hour
     hourly_counts = {}
@@ -403,35 +419,37 @@ async def get_chart_data(
     throughput_labels = []
     throughput_data = []
     for i in range(24):
-        hour = now - timedelta(hours=23-i)
+        hour = now - timedelta(hours=23 - i)
         hour_key = hour.replace(minute=0, second=0, microsecond=0)
         throughput_labels.append(hour_key.strftime("%H:%M"))
         throughput_data.append(hourly_counts.get(hour_key, 0))
 
     # Worker performance: jobs completed per worker (aggregated in DB)
     # Uses index: ix_worker_status
-    worker_stats = db.query(
-        Job.worker_id,
-        func.count(Job.id).label('completed_count')
-    ).filter(
-        Job.status == JobStatus.COMPLETED,
-        Job.worker_id.isnot(None)
-    ).group_by(Job.worker_id).limit(50).all()  # Limit to top 50 workers
+    worker_stats = (
+        db.query(Job.worker_id, func.count(Job.id).label("completed_count"))
+        .filter(Job.status == JobStatus.COMPLETED, Job.worker_id.isnot(None))
+        .group_by(Job.worker_id)
+        .limit(50)
+        .all()
+    )  # Limit to top 50 workers
 
     worker_labels = [w[0] for w in worker_stats]
     worker_data = [w[1] for w in worker_stats]
 
     # Processing times: ONLY fetch last 20 jobs (ordered by ID descending)
     # Uses primary key index for fast retrieval
-    recent_completed = db.query(
-        Job.id,
-        Job.assigned_at,
-        Job.completed_at
-    ).filter(
-        Job.status == JobStatus.COMPLETED,
-        Job.assigned_at.isnot(None),
-        Job.completed_at.isnot(None)
-    ).order_by(Job.id.desc()).limit(20).all()
+    recent_completed = (
+        db.query(Job.id, Job.assigned_at, Job.completed_at)
+        .filter(
+            Job.status == JobStatus.COMPLETED,
+            Job.assigned_at.isnot(None),
+            Job.completed_at.isnot(None),
+        )
+        .order_by(Job.id.desc())
+        .limit(20)
+        .all()
+    )
 
     avg_times = []
     avg_time_labels = []
@@ -443,15 +461,19 @@ async def get_chart_data(
 
     # Overall average processing time: Use SQL AVG for efficiency
     # Calculate average using database-level aggregation (much faster)
-    avg_result = db.query(
-        func.avg(
-            func.julianday(Job.completed_at) - func.julianday(Job.assigned_at)
-        ).label('avg_days')
-    ).filter(
-        Job.status == JobStatus.COMPLETED,
-        Job.assigned_at.isnot(None),
-        Job.completed_at.isnot(None)
-    ).first()
+    avg_result = (
+        db.query(
+            func.avg(
+                func.julianday(Job.completed_at) - func.julianday(Job.assigned_at)
+            ).label("avg_days")
+        )
+        .filter(
+            Job.status == JobStatus.COMPLETED,
+            Job.assigned_at.isnot(None),
+            Job.completed_at.isnot(None),
+        )
+        .first()
+    )
 
     # Convert from days to minutes
     total_avg_time = 0
@@ -459,32 +481,22 @@ async def get_chart_data(
         total_avg_time = round(avg_result[0] * 24 * 60, 2)
 
     # Status distribution: Use single query with grouping
-    status_counts_query = db.query(
-        Job.status,
-        func.count(Job.id).label('count')
-    ).group_by(Job.status).all()
+    status_counts_query = (
+        db.query(Job.status, func.count(Job.id).label("count"))
+        .group_by(Job.status)
+        .all()
+    )
 
     status_counts = {
-        status.value: count
-        for status, count in status_counts_query
-        if count > 0
+        status.value: count for status, count in status_counts_query if count > 0
     }
 
     return {
-        "throughput": {
-            "labels": throughput_labels,
-            "data": throughput_data
-        },
-        "workers": {
-            "labels": worker_labels,
-            "data": worker_data
-        },
-        "processing_times": {
-            "labels": avg_time_labels,
-            "data": avg_times
-        },
+        "throughput": {"labels": throughput_labels, "data": throughput_data},
+        "workers": {"labels": worker_labels, "data": worker_data},
+        "processing_times": {"labels": avg_time_labels, "data": avg_times},
         "avg_processing_time": total_avg_time,
-        "status_distribution": status_counts
+        "status_distribution": status_counts,
     }
 
 
@@ -493,16 +505,12 @@ async def jobs_list(
     request: Request,
     page: int = 1,
     status_filter: Optional[str] = None,
-    _: str = Depends(verify_admin_auth)
+    _: str = Depends(verify_admin_auth),
 ):
     """Paginated jobs list page."""
     return templates.TemplateResponse(
         "jobs_list.html",
-        {
-            "request": request,
-            "page": page,
-            "status_filter": status_filter
-        }
+        {"request": request, "page": page, "status_filter": status_filter},
     )
 
 
@@ -511,7 +519,7 @@ async def job_detail(
     request: Request,
     job_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(verify_admin_auth)
+    _: str = Depends(verify_admin_auth),
 ):
     """Job detail page with JSON viewer."""
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -519,19 +527,13 @@ async def job_detail(
         raise HTTPException(status_code=404, detail="Job not found")
 
     return templates.TemplateResponse(
-        "job_detail.html",
-        {
-            "request": request,
-            "job": job
-        }
+        "job_detail.html", {"request": request, "job": job}
     )
 
 
 @app.post("/api/jobs/{job_id}/retry")
 async def retry_job(
-    job_id: int,
-    db: Session = Depends(get_db),
-    _: str = Depends(verify_admin_auth)
+    job_id: int, db: Session = Depends(get_db), _: str = Depends(verify_admin_auth)
 ):
     """Admin endpoint to retry a failed or expired job."""
     job = db.query(Job).filter(Job.id == job_id).first()
@@ -542,7 +544,7 @@ async def retry_job(
     if job.status not in [JobStatus.FAILED, JobStatus.EXPIRED]:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot retry job with status '{job.status.value}'. Only 'failed' or 'expired' jobs can be retried."
+            detail=f"Cannot retry job with status '{job.status.value}'. Only 'failed' or 'expired' jobs can be retried.",
         )
 
     # Reset job to pending state
@@ -570,8 +572,8 @@ async def retry_job(
         "job": {
             "id": job.id,
             "status": job.status.value,
-            "retry_count": job.retry_count
-        }
+            "retry_count": job.retry_count,
+        },
     }
 
 

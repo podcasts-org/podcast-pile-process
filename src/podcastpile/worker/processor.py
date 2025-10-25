@@ -3,21 +3,22 @@
 Worker processor for Podcast Pile - diarizes audio and uploads results
 """
 
-import os
-import json
 import hashlib
-import tempfile
+import json
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
-import requests
+
 import librosa
-import soundfile as sf
-from nemo.collections.asr.models import SortformerEncLabelModel
 import nemo.collections.asr as nemo_asr
 import numpy as np
+import requests
+import soundfile as sf
+from nemo.collections.asr.models import SortformerEncLabelModel
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
     """Get GPU device information"""
     try:
         import torch
+
         if torch.cuda.is_available():
             device_id = gpu_id if gpu_id is not None else torch.cuda.current_device()
             gpu_name = torch.cuda.get_device_name(device_id)
@@ -40,6 +42,7 @@ def get_available_gpus() -> list:
     """Get list of available GPU IDs"""
     try:
         import torch
+
         if torch.cuda.is_available():
             return list(range(torch.cuda.device_count()))
     except Exception:
@@ -50,7 +53,14 @@ def get_available_gpus() -> list:
 class AudioProcessor:
     """Handles audio processing and diarization"""
 
-    def __init__(self, config: str = "high_latency", model_path: Optional[str] = None, gpu_id: Optional[int] = None, languages: str = "en", batch_size: int = 4):
+    def __init__(
+        self,
+        config: str = "high_latency",
+        model_path: Optional[str] = None,
+        gpu_id: Optional[int] = None,
+        languages: str = "en",
+        batch_size: int = 4,
+    ):
         """
         Initialize audio processor with models
 
@@ -63,25 +73,37 @@ class AudioProcessor:
         """
         self.config_name = config
         self.gpu_id = gpu_id
-        self.languages = [lang.strip().lower() for lang in languages.split(',')]
+        self.languages = [lang.strip().lower() for lang in languages.split(",")]
         self.batch_size = batch_size
         self.configs = {
             "very_high_latency": {
-                "CHUNK_SIZE": 340, "RIGHT_CONTEXT": 40, "FIFO_SIZE": 40,
-                "UPDATE_PERIOD": 300, "SPEAKER_CACHE_SIZE": 188
+                "CHUNK_SIZE": 340,
+                "RIGHT_CONTEXT": 40,
+                "FIFO_SIZE": 40,
+                "UPDATE_PERIOD": 300,
+                "SPEAKER_CACHE_SIZE": 188,
             },
             "high_latency": {
-                "CHUNK_SIZE": 124, "RIGHT_CONTEXT": 1, "FIFO_SIZE": 124,
-                "UPDATE_PERIOD": 124, "SPEAKER_CACHE_SIZE": 188
+                "CHUNK_SIZE": 124,
+                "RIGHT_CONTEXT": 1,
+                "FIFO_SIZE": 124,
+                "UPDATE_PERIOD": 124,
+                "SPEAKER_CACHE_SIZE": 188,
             },
             "low_latency": {
-                "CHUNK_SIZE": 6, "RIGHT_CONTEXT": 7, "FIFO_SIZE": 188,
-                "UPDATE_PERIOD": 144, "SPEAKER_CACHE_SIZE": 188
+                "CHUNK_SIZE": 6,
+                "RIGHT_CONTEXT": 7,
+                "FIFO_SIZE": 188,
+                "UPDATE_PERIOD": 144,
+                "SPEAKER_CACHE_SIZE": 188,
             },
             "ultra_low_latency": {
-                "CHUNK_SIZE": 3, "RIGHT_CONTEXT": 1, "FIFO_SIZE": 188,
-                "UPDATE_PERIOD": 144, "SPEAKER_CACHE_SIZE": 188
-            }
+                "CHUNK_SIZE": 3,
+                "RIGHT_CONTEXT": 1,
+                "FIFO_SIZE": 188,
+                "UPDATE_PERIOD": 144,
+                "SPEAKER_CACHE_SIZE": 188,
+            },
         }
 
         self.diar_model = None
@@ -96,8 +118,11 @@ class AudioProcessor:
         if self.gpu_id is not None:
             try:
                 import torch
+
                 torch.cuda.set_device(self.gpu_id)
-                logger.info(f"Using GPU {self.gpu_id}: {torch.cuda.get_device_name(self.gpu_id)}")
+                logger.info(
+                    f"Using GPU {self.gpu_id}: {torch.cuda.get_device_name(self.gpu_id)}"
+                )
             except Exception as e:
                 logger.warning(f"Could not set GPU {self.gpu_id}: {e}")
 
@@ -105,15 +130,13 @@ class AudioProcessor:
 
         # Determine map location for model loading
         if self.gpu_id is not None:
-            map_location = f'cuda:{self.gpu_id}'
+            map_location = f"cuda:{self.gpu_id}"
         else:
-            map_location = 'cpu'
+            map_location = "cpu"
 
         if self.model_path and os.path.exists(self.model_path):
             self.diar_model = SortformerEncLabelModel.restore_from(
-                restore_path=self.model_path,
-                map_location=map_location,
-                strict=False
+                restore_path=self.model_path, map_location=map_location, strict=False
             )
         else:
             self.diar_model = SortformerEncLabelModel.from_pretrained(
@@ -127,8 +150,8 @@ class AudioProcessor:
         logger.info(f"✓ Diarization model loaded on {map_location}")
 
         # Determine which ASR models to load based on languages
-        needs_chinese = 'zh' in self.languages or 'cn' in self.languages
-        needs_english = any(lang not in ['zh', 'cn'] for lang in self.languages)
+        needs_chinese = "zh" in self.languages or "cn" in self.languages
+        needs_english = any(lang not in ["zh", "cn"] for lang in self.languages)
 
         # Load Parakeet (English) if needed
         if needs_english:
@@ -138,7 +161,7 @@ class AudioProcessor:
             )
             # Move to correct GPU if specified
             if self.gpu_id is not None:
-                self.asr_model = self.asr_model.to(f'cuda:{self.gpu_id}')
+                self.asr_model = self.asr_model.to(f"cuda:{self.gpu_id}")
             self.asr_model.eval()
             logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
 
@@ -156,7 +179,7 @@ class AudioProcessor:
                     punc_model="ct-punc-c",
                     punc_model_revision="v2.0.4",
                     hub="hf",
-                    device=f"cuda:{self.gpu_id}" if self.gpu_id is not None else "cpu"
+                    device=f"cuda:{self.gpu_id}" if self.gpu_id is not None else "cpu",
                 )
                 logger.info(f"✓ Paraformer model loaded on {map_location}")
             except ImportError as e:
@@ -171,11 +194,12 @@ class AudioProcessor:
         logger.info("Loading BGM classifier...")
         try:
             from transformers import pipeline
+
             self.bgm_classifier = pipeline(
                 "audio-classification",
                 model="podcasts-org/detect-background-music",
-                token="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", # Repo-specific access
-                device=self.gpu_id if self.gpu_id is not None else -1
+                token="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",  # Repo-specific access
+                device=self.gpu_id if self.gpu_id is not None else -1,
             )
             logger.info("✓ BGM classifier loaded")
         except Exception as e:
@@ -187,7 +211,9 @@ class AudioProcessor:
         self.diar_model.sortformer_modules.chunk_len = config["CHUNK_SIZE"]
         self.diar_model.sortformer_modules.chunk_right_context = config["RIGHT_CONTEXT"]
         self.diar_model.sortformer_modules.fifo_len = config["FIFO_SIZE"]
-        self.diar_model.sortformer_modules.spkcache_update_period = config["UPDATE_PERIOD"]
+        self.diar_model.sortformer_modules.spkcache_update_period = config[
+            "UPDATE_PERIOD"
+        ]
         self.diar_model.sortformer_modules.spkcache_len = config["SPEAKER_CACHE_SIZE"]
         self.diar_model.sortformer_modules._check_streaming_parameters()
         logger.info(f"✓ Using {self.config_name} configuration")
@@ -199,7 +225,7 @@ class AudioProcessor:
 
         if audio.ndim > 1:
             logger.info(f"Converting {audio_path} to mono...")
-            mono_path = str(Path(audio_path).with_suffix('')) + '_mono.wav'
+            mono_path = str(Path(audio_path).with_suffix("")) + "_mono.wav"
             audio_mono = librosa.to_mono(audio)
             sf.write(mono_path, audio_mono, sr)
             return mono_path
@@ -225,12 +251,11 @@ class AudioProcessor:
                 sha256_hash.update(byte_block)
                 md5_hash.update(byte_block)
 
-        return {
-            "sha256": sha256_hash.hexdigest(),
-            "md5": md5_hash.hexdigest()
-        }
+        return {"sha256": sha256_hash.hexdigest(), "md5": md5_hash.hexdigest()}
 
-    def diarize_audio(self, audio_path: str, episode_url: str = None, language: str = None) -> Dict:
+    def diarize_audio(
+        self, audio_path: str, episode_url: str = None, language: str = None
+    ) -> Dict:
         """
         Diarize a single audio file and return results
 
@@ -264,33 +289,43 @@ class AudioProcessor:
 
         # Parse segments into structured format
         results = []
-        segment_list = segments[0] if isinstance(segments, list) and len(segments) > 0 else segments
+        segment_list = (
+            segments[0]
+            if isinstance(segments, list) and len(segments) > 0
+            else segments
+        )
 
         for seg in segment_list:
             if isinstance(seg, str):
                 parts = seg.split()
                 start = float(parts[0])
                 end = float(parts[1])
-                speaker = parts[2].replace('speaker_', '')  # Remove 'speaker_' prefix
-                results.append({
-                    "start": start,
-                    "end": end,
-                    "speaker": speaker,
-                    "duration": end - start
-                })
+                speaker = parts[2].replace("speaker_", "")  # Remove 'speaker_' prefix
+                results.append(
+                    {
+                        "start": start,
+                        "end": end,
+                        "speaker": speaker,
+                        "duration": end - start,
+                    }
+                )
 
         # Extract audio segments and save to temp files
         logger.info(f"Extracting {len(results)} segments...")
         temp_files = []
         for i, segment in enumerate(results):
-            segment_audio = self.extract_audio_segment(audio, sr, segment["start"], segment["end"])
+            segment_audio = self.extract_audio_segment(
+                audio, sr, segment["start"], segment["end"]
+            )
             temp_path = f"/tmp/segment_{i}_{os.getpid()}.wav"
             sf.write(temp_path, segment_audio, 16000)
             temp_files.append(temp_path)
 
         try:
             # Transcribe all segments at once using appropriate model
-            is_chinese = language and (language.lower() == 'zh' or language.lower() == 'cn')
+            is_chinese = language and (
+                language.lower() == "zh" or language.lower() == "cn"
+            )
 
             logger.info(f"Transcribing {len(temp_files)} segments...")
             if is_chinese and self.zh_asr_model:
@@ -299,17 +334,16 @@ class AudioProcessor:
 
                 # Pass all temp files at once
                 paraformer_results = self.zh_asr_model.generate(
-                    input=temp_files,
-                    batch_size_s=300
+                    input=temp_files, batch_size_s=300
                 )
 
                 # Extract text from results - format is [{'key': 'filename', 'text': 'transcription'}, ...]
                 transcriptions = []
                 for result in paraformer_results:
                     if isinstance(result, dict):
-                        transcriptions.append(result.get('text', ''))
+                        transcriptions.append(result.get("text", ""))
                     else:
-                        transcriptions.append('')
+                        transcriptions.append("")
 
             elif self.asr_model:
                 # Use Parakeet for English/other languages
@@ -321,11 +355,15 @@ class AudioProcessor:
                 transcriptions = ["" for _ in temp_files]
 
             # Add transcriptions to results
-            logger.info(f"Adding {len(transcriptions)} transcriptions to {len(results)} segments")
+            logger.info(
+                f"Adding {len(transcriptions)} transcriptions to {len(results)} segments"
+            )
             for i in range(len(results)):
                 results[i]["transcription"] = transcriptions[i]
                 if i < 3:  # Log first 3 for debugging
-                    logger.debug(f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'...")
+                    logger.debug(
+                        f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'..."
+                    )
 
             # BGM classification for all segments (batched)
             logger.info(f"Classifying BGM for {len(temp_files)} segments...")
@@ -334,7 +372,9 @@ class AudioProcessor:
             audio_inputs = []
             for temp_file in temp_files:
                 try:
-                    segment_audio, segment_sr = librosa.load(temp_file, sr=16000, mono=True)
+                    segment_audio, segment_sr = librosa.load(
+                        temp_file, sr=16000, mono=True
+                    )
 
                     # Normalize to float32
                     if segment_audio.dtype == np.int16:
@@ -342,13 +382,20 @@ class AudioProcessor:
                     elif segment_audio.dtype == np.int32:
                         segment_audio = segment_audio.astype(np.float32) / 2147483648.0
 
-                    audio_inputs.append({"array": segment_audio, "sampling_rate": segment_sr})
+                    audio_inputs.append(
+                        {"array": segment_audio, "sampling_rate": segment_sr}
+                    )
                 except Exception as e:
                     logger.warning(f"Failed to load audio for BGM classification: {e}")
                     audio_inputs.append(None)
 
             # Batch classify with progress bar
-            for i in tqdm(range(len(audio_inputs)), desc="Classifying BGM", unit="segment", dynamic_ncols=True):
+            for i in tqdm(
+                range(len(audio_inputs)),
+                desc="Classifying BGM",
+                unit="segment",
+                dynamic_ncols=True,
+            ):
                 try:
                     if audio_inputs[i] is None:
                         results[i]["bgm_probability"] = 0.0
@@ -360,8 +407,8 @@ class AudioProcessor:
                     # Extract BGM probability
                     bgm_prob = 0.0
                     for pred in predictions:
-                        if pred['label'] == 'bgm':
-                            bgm_prob = pred['score']
+                        if pred["label"] == "bgm":
+                            bgm_prob = pred["score"]
                             break
 
                     results[i]["bgm_probability"] = bgm_prob
@@ -393,10 +440,10 @@ class AudioProcessor:
             "num_segments": len(results),
             "segments": results,
             "file_hashes": hashes,
-            "num_speakers": len(set(s['speaker'] for s in results)),
+            "num_speakers": len(set(s["speaker"] for s in results)),
             "processing_time": processing_time,
             "gpu_info": gpu_info,
-            "processed_at": datetime.utcnow().isoformat() + "Z"
+            "processed_at": datetime.utcnow().isoformat() + "Z",
         }
 
         logger.info(f"✓ Processed {len(results)} segments in {processing_time:.2f}s")
@@ -419,7 +466,7 @@ class PodcastPileWorker:
         model_path: Optional[str] = None,
         gpu_id: Optional[int] = None,
         languages: str = "en",
-        batch_size: int = 4
+        batch_size: int = 4,
     ):
         """
         Initialize worker
@@ -434,11 +481,17 @@ class PodcastPileWorker:
             languages: Comma-separated language codes worker will process
             batch_size: Batch size for FireRedASR transcription (default: 4)
         """
-        self.manager_url = manager_url.rstrip('/')
+        self.manager_url = manager_url.rstrip("/")
         self.worker_id = worker_id
         self.worker_password = worker_password
         self.gpu_id = gpu_id
-        self.processor = AudioProcessor(config=config, model_path=model_path, gpu_id=gpu_id, languages=languages, batch_size=batch_size)
+        self.processor = AudioProcessor(
+            config=config,
+            model_path=model_path,
+            gpu_id=gpu_id,
+            languages=languages,
+            batch_size=batch_size,
+        )
 
         # Headers for API requests
         self.headers = {}
@@ -460,10 +513,7 @@ class PodcastPileWorker:
             Job dict or None if no jobs available
         """
         url = f"{self.manager_url}/api/jobs/request"
-        params = {
-            "worker_id": self.worker_id,
-            "languages": languages
-        }
+        params = {"worker_id": self.worker_id, "languages": languages}
 
         try:
             response = requests.post(url, params=params, headers=self.headers)
@@ -499,12 +549,12 @@ class PodcastPileWorker:
 
         # Determine file extension from URL or content-type
         ext = ".mp3"  # Default
-        if url.endswith(('.wav', '.mp3', '.m4a', '.flac', '.ogg')):
+        if url.endswith((".wav", ".mp3", ".m4a", ".flac", ".ogg")):
             ext = Path(url).suffix
 
         filepath = os.path.join(temp_dir, f"audio{ext}")
 
-        with open(filepath, 'wb') as f:
+        with open(filepath, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
 
@@ -552,13 +602,15 @@ class PodcastPileWorker:
             "diarization": self._format_diarization(results),
             "processing_duration": results.get("processing_time"),
             "worker_gpu": results.get("gpu_info"),
-            "processed_at": results.get("processed_at")
+            "processed_at": results.get("processed_at"),
         }
 
         params = {"worker_id": self.worker_id}
 
         try:
-            response = requests.post(url, params=params, json=payload, headers=self.headers)
+            response = requests.post(
+                url, params=params, json=payload, headers=self.headers
+            )
             response.raise_for_status()
             logger.info(f"✓ Submitted results for job #{job_id}")
             return True
@@ -566,7 +618,9 @@ class PodcastPileWorker:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error submitting results: {e}")
             try:
-                logger.error(f"Response body: {e.response.text if e.response else 'N/A'}")
+                logger.error(
+                    f"Response body: {e.response.text if e.response else 'N/A'}"
+                )
             except:
                 pass
             return False
@@ -574,10 +628,7 @@ class PodcastPileWorker:
     def report_failure(self, job_id: int, error_message: str) -> bool:
         """Report job failure to manager"""
         url = f"{self.manager_url}/api/jobs/{job_id}/fail"
-        params = {
-            "worker_id": self.worker_id,
-            "error_message": error_message
-        }
+        params = {"worker_id": self.worker_id, "error_message": error_message}
 
         try:
             response = requests.post(url, params=params, headers=self.headers)
@@ -637,9 +688,7 @@ class PodcastPileWorker:
 
             # Process audio with metadata
             results = self.processor.diarize_audio(
-                audio_path,
-                episode_url=episode_url,
-                language=language
+                audio_path, episode_url=episode_url, language=language
             )
 
             # Submit results
@@ -655,6 +704,7 @@ class PodcastPileWorker:
         finally:
             # Cleanup temp directory
             import shutil
+
             shutil.rmtree(temp_dir, ignore_errors=True)
 
     def run_once(self, languages: str = "en") -> bool:

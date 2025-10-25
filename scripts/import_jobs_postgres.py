@@ -11,27 +11,28 @@ Usage:
 Requires PostgreSQL database (won't work with SQLite).
 """
 
-import sys
-import json
 import argparse
-import time
-import tempfile
 import csv
-from pathlib import Path
+import json
+import sys
+import tempfile
+import time
 from datetime import datetime
+from pathlib import Path
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from sqlalchemy import create_engine, text
+
 from podcastpile.config import config
 
 
 def parse_language(lang_str: str) -> str:
     """Extract first 2 letters of language code in lowercase"""
     if not lang_str:
-        return ''
-    lang = lang_str.split('-')[0].split('_')[0]
+        return ""
+    lang = lang_str.split("-")[0].split("_")[0]
     return lang[:2].lower()
 
 
@@ -47,7 +48,10 @@ def import_jsonl_postgres(filepath: str):
     print(f"Starting PostgreSQL COPY import from {filepath}")
     print("=" * 60)
 
-    if 'postgresql' not in config.DATABASE_URL and 'postgres' not in config.DATABASE_URL:
+    if (
+        "postgresql" not in config.DATABASE_URL
+        and "postgres" not in config.DATABASE_URL
+    ):
         print("ERROR: This script requires PostgreSQL.", file=sys.stderr)
         print("For SQLite, use import_jobs.py instead", file=sys.stderr)
         sys.exit(1)
@@ -56,18 +60,18 @@ def import_jsonl_postgres(filepath: str):
     start_time = time.time()
 
     # Create temporary CSV file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
         tmp_path = tmp.name
         writer = csv.writer(tmp)
 
         # Write header (must match temp table columns)
-        writer.writerow(['episode_url', 'podcast_id', 'language'])
+        writer.writerow(["episode_url", "podcast_id", "language"])
 
         # Convert JSONL to CSV
         total_rows = 0
         print("Converting JSONL to CSV...")
 
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
@@ -75,12 +79,12 @@ def import_jsonl_postgres(filepath: str):
 
                 try:
                     data = json.loads(line)
-                    episode_url = data.get('episode_url')
+                    episode_url = data.get("episode_url")
                     if not episode_url:
                         continue
 
-                    podcast_id = data.get('podcast_id', '')
-                    language = parse_language(data.get('language'))
+                    podcast_id = data.get("podcast_id", "")
+                    language = parse_language(data.get("language"))
 
                     writer.writerow([episode_url, podcast_id, language])
                     total_rows += 1
@@ -89,7 +93,10 @@ def import_jsonl_postgres(filepath: str):
                         print(f"  Converted {total_rows:,} rows...")
 
                 except json.JSONDecodeError as e:
-                    print(f"Warning: Invalid JSON at line {line_num}: {e}", file=sys.stderr)
+                    print(
+                        f"Warning: Invalid JSON at line {line_num}: {e}",
+                        file=sys.stderr,
+                    )
                     continue
 
     convert_time = time.time() - start_time
@@ -106,13 +113,17 @@ def import_jsonl_postgres(filepath: str):
 
             # Create temporary table
             print("  Creating temporary table...")
-            conn.execute(text("""
+            conn.execute(
+                text(
+                    """
                 CREATE TEMPORARY TABLE temp_jobs (
                     episode_url VARCHAR NOT NULL,
                     podcast_id VARCHAR,
                     language VARCHAR
                 )
-            """))
+            """
+                )
+            )
 
             # COPY data from CSV into temp table
             print("  Loading data with COPY...")
@@ -122,7 +133,7 @@ def import_jsonl_postgres(filepath: str):
             raw_conn = conn.connection
             cursor = raw_conn.cursor()
 
-            with open(tmp_path, 'r') as f:
+            with open(tmp_path, "r") as f:
                 # Skip header
                 next(f)
                 cursor.copy_expert(
@@ -130,17 +141,21 @@ def import_jsonl_postgres(filepath: str):
                     COPY temp_jobs (episode_url, podcast_id, language)
                     FROM STDIN WITH CSV
                     """,
-                    f
+                    f,
                 )
 
             copy_time = time.time() - copy_start
-            print(f"  ✓ COPY completed in {copy_time:.2f}s ({total_rows/copy_time:.0f} rows/sec)")
+            print(
+                f"  ✓ COPY completed in {copy_time:.2f}s ({total_rows/copy_time:.0f} rows/sec)"
+            )
 
             # Insert from temp table, skipping duplicates
             print("  Inserting non-duplicate rows...")
             insert_start = time.time()
 
-            result = conn.execute(text("""
+            result = conn.execute(
+                text(
+                    """
                 INSERT INTO jobs (
                     episode_url,
                     podcast_id,
@@ -184,7 +199,9 @@ def import_jsonl_postgres(filepath: str):
                 WHERE NOT EXISTS (
                     SELECT 1 FROM jobs j WHERE j.episode_url = t.episode_url
                 )
-            """))
+            """
+                )
+            )
 
             inserted = result.rowcount
             insert_time = time.time() - insert_start
@@ -222,10 +239,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ultra-fast PostgreSQL bulk import using COPY"
     )
-    parser.add_argument(
-        "input_file",
-        help="Path to JSONL file with job data"
-    )
+    parser.add_argument("input_file", help="Path to JSONL file with job data")
 
     args = parser.parse_args()
 
