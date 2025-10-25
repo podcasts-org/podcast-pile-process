@@ -84,7 +84,8 @@ class AudioProcessor:
 
         self.diar_model = None
         self.asr_model = None  # Parakeet (English)
-        self.zh_asr_model = None  # FireRedASR (Chinese)
+        self.zh_asr_model = None  # Paraformer (Chinese)
+        self.bgm_classifier = None  # BGM detection
         self.model_path = model_path
 
     def load_models(self):
@@ -163,6 +164,21 @@ class AudioProcessor:
             except Exception as e:
                 logger.error(f"Failed to load Paraformer model: {e}")
                 raise
+
+        # Load BGM classifier
+        logger.info("Loading BGM classifier...")
+        try:
+            from transformers import pipeline
+            self.bgm_classifier = pipeline(
+                "audio-classification",
+                model="podcasts-org/detect-background-music",
+                token="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", # Repo-specific access
+                device=self.gpu_id if self.gpu_id is not None else -1
+            )
+            logger.info("✓ BGM classifier loaded")
+        except Exception as e:
+            logger.error(f"Failed to load BGM classifier: {e}")
+            raise
 
         # Set streaming configuration
         config = self.configs[self.config_name]
@@ -308,6 +324,41 @@ class AudioProcessor:
                 results[i]["transcription"] = transcriptions[i]
                 if i < 3:  # Log first 3 for debugging
                     logger.debug(f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'...")
+
+            # BGM classification for each segment
+            logger.info(f"Classifying BGM for {len(temp_files)} segments...")
+            import numpy as np
+            for i, temp_file in enumerate(temp_files):
+                try:
+                    # Load segment audio
+                    segment_audio, segment_sr = librosa.load(temp_file, sr=16000, mono=True)
+
+                    # Normalize to float32
+                    if segment_audio.dtype == np.int16:
+                        segment_audio = segment_audio.astype(np.float32) / 32768.0
+                    elif segment_audio.dtype == np.int32:
+                        segment_audio = segment_audio.astype(np.float32) / 2147483648.0
+
+                    # Classify using pipeline
+                    predictions = self.bgm_classifier({
+                        "array": segment_audio,
+                        "sampling_rate": segment_sr
+                    })
+
+                    # Extract BGM probability (predictions is list of dicts: [{'label': 'bgm', 'score': 0.9}, ...])
+                    bgm_prob = 0.0
+                    for pred in predictions:
+                        if pred['label'] == 'bgm':
+                            bgm_prob = pred['score']
+                            break
+
+                    results[i]["bgm_probability"] = bgm_prob
+                    results[i]["bgm"] = bgm_prob > 0.5
+
+                except Exception as e:
+                    logger.warning(f"BGM classification failed for segment {i}: {e}")
+                    results[i]["bgm_probability"] = 0.0
+                    results[i]["bgm"] = False
 
         finally:
             # Clean up temporary files
