@@ -4,6 +4,7 @@ import socket
 import click
 import httpx
 import uvicorn
+from dotenv import load_dotenv
 
 
 @click.group()
@@ -18,6 +19,9 @@ def cli():
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
 def manager(port, host, reload):
     """Run the manager server."""
+    # Load environment variables from .env file
+    load_dotenv()
+
     click.echo(f"Starting Podcast Pile Manager on {host}:{port}...")
     uvicorn.run("podcastpile.manager.server:app", host=host, port=port, reload=reload)
 

@@ -18,6 +18,7 @@ setup(
         "python-dateutil>=2.8.2",
         "click>=8.1.0",
         "requests>=2.31.0",
+        "python-dotenv>=1.0.0",
     ],
     extras_require={
         # Worker dependencies (heavy ML packages)
