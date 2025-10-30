@@ -26,10 +26,29 @@ async def verify_worker_auth(x_worker_password: Optional[str] = Header(None)):
     return True
 
 
-async def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(security)):
+async def verify_admin_auth(
+    credentials: Optional[HTTPBasicCredentials] = Depends(
+        lambda: HTTPBasic(auto_error=False)
+    )
+):
     """Verify admin authentication if enabled."""
     if not config.ADMIN_AUTH_ENABLED:
         return True
+
+    # If auth is enabled, credentials are required
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    # Ensure password is configured
+    if not config.ADMIN_PASSWORD:
+        raise HTTPException(
+            status_code=500,
+            detail="Admin password not configured",
+        )
 
     # Use constant-time comparison to prevent timing attacks
     correct_username = secrets.compare_digest(
