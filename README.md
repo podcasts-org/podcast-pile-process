@@ -1,6 +1,6 @@
 # Podcast Pile
 
-Data processing infra for Podcast Pile.
+Data processing infra for Podcast Pile. [Manager server](https://podcastpile.mrfake.name/)
 
 ## Architecture
 
