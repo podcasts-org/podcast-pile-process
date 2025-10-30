@@ -6,7 +6,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from ..config import config
 
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
 
 
 async def verify_worker_auth(x_worker_password: Optional[str] = Header(None)):
@@ -27,9 +27,7 @@ async def verify_worker_auth(x_worker_password: Optional[str] = Header(None)):
 
 
 async def verify_admin_auth(
-    credentials: Optional[HTTPBasicCredentials] = Depends(
-        lambda: HTTPBasic(auto_error=False)
-    )
+    credentials: Optional[HTTPBasicCredentials] = Depends(security)
 ):
     """Verify admin authentication if enabled."""
     if not config.ADMIN_AUTH_ENABLED:
