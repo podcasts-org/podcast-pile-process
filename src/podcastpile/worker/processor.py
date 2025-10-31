@@ -480,9 +480,50 @@ class S3Uploader:
         )
         logger.info(f"S3 uploader initialized (bucket: {self.bucket})")
 
+    def compress_audio(self, input_path: str) -> str:
+        """
+        Compress audio to MP3 with fast, reasonable settings for podcasts
+
+        Args:
+            input_path: Path to input audio file
+
+        Returns:
+            Path to compressed MP3 file
+        """
+        import subprocess
+
+        # Create compressed filename
+        compressed_path = str(Path(input_path).with_suffix("")) + "_compressed.mp3"
+
+        # Use ffmpeg with fast preset, variable bitrate optimized for voice
+        # -q:a 4 gives VBR ~128kbps average (good for podcasts, not music)
+        # -preset fast prioritizes speed over compression efficiency
+        # -ac 1 converts to mono (podcasts rarely need stereo)
+        cmd = [
+            "ffmpeg",
+            "-i", input_path,
+            "-q:a", "4",  # VBR quality (~128kbps, good for voice)
+            "-ac", "1",   # Mono
+            "-ar", "44100",  # 44.1kHz sample rate
+            "-y",  # Overwrite output file
+            "-loglevel", "error",  # Only show errors
+            compressed_path
+        ]
+
+        logger.info(f"Compressing {Path(input_path).name} to MP3...")
+        subprocess.run(cmd, check=True, capture_output=True)
+
+        # Log size reduction
+        original_size = os.path.getsize(input_path)
+        compressed_size = os.path.getsize(compressed_path)
+        reduction = (1 - compressed_size / original_size) * 100
+        logger.info(f"✓ Compressed: {original_size/(1024*1024):.1f}MB → {compressed_size/(1024*1024):.1f}MB ({reduction:.0f}% reduction)")
+
+        return compressed_path
+
     def upload_file_threaded(self, file_path: str, file_hash: str) -> threading.Thread:
         """
-        Upload file to S3 in a background thread using SHA256 hash for organization
+        Compress and upload file to S3 in a background thread using SHA256 hash for organization
 
         Args:
             file_path: Local path to file
@@ -495,21 +536,48 @@ class S3Uploader:
         # With 3 hex chars, we get 4096 possible subfolders (16^3)
         subfolder = file_hash[:3]
         filename = Path(file_path).name
-        object_name = f"{subfolder}/{file_hash}_{filename}"
+        # Use .mp3 extension since we'll compress to MP3
+        base_name = Path(filename).stem
+        object_name = f"{subfolder}/{file_hash}_{base_name}.mp3"
 
         def upload_task():
+            compressed_path = None
+            upload_path = file_path
+            upload_object_name = object_name
+
             try:
-                logger.info(f"Uploading {filename} to S3 as {object_name}...")
-                self.s3_client.upload_file(file_path, self.bucket, object_name)
-                url = f"{self.s3_client.meta.endpoint_url}/{self.bucket}/{object_name}"
+                # Try to compress audio (this happens in background, not blocking GPU)
+                try:
+                    compressed_path = self.compress_audio(file_path)
+                    upload_path = compressed_path
+                except Exception as compress_error:
+                    logger.warning(f"Compression failed: {compress_error}")
+                    logger.info("Falling back to uploading original file")
+                    # Use original filename extension for fallback
+                    original_ext = Path(filename).suffix
+                    upload_object_name = f"{subfolder}/{file_hash}_{Path(filename).stem}{original_ext}"
+                    upload_path = file_path
+
+                logger.info(f"Uploading {Path(upload_path).name} to S3 as {upload_object_name}...")
+                self.s3_client.upload_file(upload_path, self.bucket, upload_object_name)
+                url = f"{self.s3_client.meta.endpoint_url}/{self.bucket}/{upload_object_name}"
                 logger.info(f"✓ Uploaded to S3: {url}")
 
-                # Delete local file after successful upload
+                # Delete both original and compressed files after successful upload
                 if os.path.exists(file_path):
                     os.remove(file_path)
-                    logger.info(f"✓ Deleted local file: {file_path}")
+                    logger.info(f"✓ Deleted original file: {file_path}")
+                if compressed_path and os.path.exists(compressed_path):
+                    os.remove(compressed_path)
+                    logger.info(f"✓ Deleted compressed file: {compressed_path}")
             except Exception as e:
                 logger.error(f"✗ Error uploading {filename} to S3: {e}")
+                # Clean up compressed file on error
+                if compressed_path and os.path.exists(compressed_path):
+                    try:
+                        os.remove(compressed_path)
+                    except:
+                        pass
 
         thread = threading.Thread(target=upload_task, daemon=True)
         thread.start()
