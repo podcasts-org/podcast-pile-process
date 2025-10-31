@@ -10,6 +10,7 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
@@ -314,11 +315,12 @@ class AudioProcessor:
         # Extract audio segments and save to temp files
         logger.info(f"Extracting {len(results)} segments...")
         temp_files = []
+        session_id = uuid.uuid4().hex[:8]  # Unique ID for this diarization session
         for i, segment in enumerate(results):
             segment_audio = self.extract_audio_segment(
                 audio, sr, segment["start"], segment["end"]
             )
-            temp_path = f"/tmp/segment_{i}_{os.getpid()}.wav"
+            temp_path = f"/tmp/segment_{session_id}_{i}.wav"
             sf.write(temp_path, segment_audio, 16000)
             temp_files.append(temp_path)
 
@@ -492,8 +494,10 @@ class S3Uploader:
         """
         import subprocess
 
-        # Create compressed filename
-        compressed_path = str(Path(input_path).with_suffix("")) + "_compressed.mp3"
+        # Create compressed filename with UUID to avoid conflicts
+        base_path = Path(input_path).with_suffix("")
+        unique_id = uuid.uuid4().hex[:8]  # Use first 8 chars of UUID for brevity
+        compressed_path = f"{base_path}_compressed_{unique_id}.mp3"
 
         # Use ffmpeg with fast preset, variable bitrate optimized for voice
         # -q:a 4 gives VBR ~128kbps average (good for podcasts, not music)
