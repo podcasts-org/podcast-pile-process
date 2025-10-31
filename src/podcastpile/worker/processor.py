@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -455,6 +456,66 @@ class AudioProcessor:
         return output_record
 
 
+class S3Uploader:
+    """Handles S3 uploads in a background thread"""
+
+    def __init__(self, s3_config: Dict):
+        """
+        Initialize S3 uploader
+
+        Args:
+            s3_config: Dict with keys: endpoint_url, access_key_id, secret_access_key, bucket, region
+        """
+        import boto3
+        from botocore.client import Config
+
+        self.bucket = s3_config["bucket"]
+        self.s3_client = boto3.client(
+            "s3",
+            endpoint_url=s3_config["endpoint_url"],
+            aws_access_key_id=s3_config["access_key_id"],
+            aws_secret_access_key=s3_config["secret_access_key"],
+            config=Config(signature_version="s3v4"),
+            region_name=s3_config["region"],
+        )
+        logger.info(f"S3 uploader initialized (bucket: {self.bucket})")
+
+    def upload_file_threaded(self, file_path: str, file_hash: str) -> threading.Thread:
+        """
+        Upload file to S3 in a background thread using SHA256 hash for organization
+
+        Args:
+            file_path: Local path to file
+            file_hash: SHA256 hash of the file
+
+        Returns:
+            Thread object that is uploading the file
+        """
+        # Use first 3 characters of hash for subfolder to avoid too many files in one folder
+        # With 3 hex chars, we get 4096 possible subfolders (16^3)
+        subfolder = file_hash[:3]
+        filename = Path(file_path).name
+        object_name = f"{subfolder}/{file_hash}_{filename}"
+
+        def upload_task():
+            try:
+                logger.info(f"Uploading {filename} to S3 as {object_name}...")
+                self.s3_client.upload_file(file_path, self.bucket, object_name)
+                url = f"{self.s3_client.meta.endpoint_url}/{self.bucket}/{object_name}"
+                logger.info(f"✓ Uploaded to S3: {url}")
+
+                # Delete local file after successful upload
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"✓ Deleted local file: {file_path}")
+            except Exception as e:
+                logger.error(f"✗ Error uploading {filename} to S3: {e}")
+
+        thread = threading.Thread(target=upload_task, daemon=True)
+        thread.start()
+        return thread
+
+
 class PodcastPileWorker:
     """Worker that fetches jobs and processes them"""
 
@@ -468,6 +529,7 @@ class PodcastPileWorker:
         gpu_id: Optional[int] = None,
         languages: str = "en",
         batch_size: int = 4,
+        s3_config: Optional[Dict] = None,
     ):
         """
         Initialize worker
@@ -481,6 +543,7 @@ class PodcastPileWorker:
             gpu_id: GPU device ID to use (None for auto-select)
             languages: Comma-separated language codes worker will process
             batch_size: Batch size for FireRedASR transcription (default: 4)
+            s3_config: Optional S3 configuration for audio uploads
         """
         self.manager_url = manager_url.rstrip("/")
         self.worker_id = worker_id
@@ -493,6 +556,9 @@ class PodcastPileWorker:
             languages=languages,
             batch_size=batch_size,
         )
+
+        # Initialize S3 uploader if config provided
+        self.s3_uploader = S3Uploader(s3_config) if s3_config else None
 
         # Headers for API requests
         self.headers = {}
@@ -682,18 +748,34 @@ class PodcastPileWorker:
         self.update_job_status(job_id, "processing")
 
         temp_dir = tempfile.mkdtemp()
+        upload_thread = None
 
         try:
             # Download audio
             audio_path = self.download_audio(episode_url, temp_dir)
 
-            # Process audio with metadata
+            # Start S3 upload in background if configured
+            if self.s3_uploader:
+                # Compute hash for the audio file
+                file_hash = self.processor.compute_file_hashes(audio_path)["sha256"]
+                upload_thread = self.s3_uploader.upload_file_threaded(
+                    audio_path, file_hash
+                )
+                logger.info("S3 upload started in background thread")
+
+            # Process audio with metadata (GPU work happens here)
             results = self.processor.diarize_audio(
                 audio_path, episode_url=episode_url, language=language
             )
 
             # Submit results
             success = self.submit_results(job_id, results)
+
+            # Wait for S3 upload to complete before finishing
+            if upload_thread:
+                logger.info("Waiting for S3 upload to complete...")
+                upload_thread.join()
+                logger.info("S3 upload thread finished")
 
             return success
 
@@ -703,7 +785,7 @@ class PodcastPileWorker:
             return False
 
         finally:
-            # Cleanup temp directory
+            # Cleanup temp directory (but audio file may already be deleted by S3 uploader)
             import shutil
 
             shutil.rmtree(temp_dir, ignore_errors=True)

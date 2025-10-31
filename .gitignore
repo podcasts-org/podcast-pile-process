@@ -226,3 +226,6 @@ input.jsonl
 
 # Claude
 .claude/
+
+# S3
+test_s3.py

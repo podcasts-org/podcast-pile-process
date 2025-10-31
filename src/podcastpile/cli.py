@@ -70,6 +70,34 @@ def manager(port, host, reload):
 @click.option("--all-gpus", is_flag=True, help="Spawn a worker on each available GPU")
 @click.option("--gpus", help='Comma-separated list of GPU IDs to use (e.g., "0,1,3")')
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--s3-endpoint",
+    envvar="S3_ENDPOINT_URL",
+    default="https://s3.mrfake.name",
+    help="S3 endpoint URL (default: https://s3.mrfake.name, can also use S3_ENDPOINT_URL env var)",
+)
+@click.option(
+    "--s3-access-key",
+    envvar="S3_ACCESS_KEY_ID",
+    help="S3 access key ID (can also use S3_ACCESS_KEY_ID env var)",
+)
+@click.option(
+    "--s3-secret-key",
+    envvar="S3_SECRET_ACCESS_KEY",
+    help="S3 secret access key (can also use S3_SECRET_ACCESS_KEY env var)",
+)
+@click.option(
+    "--s3-bucket",
+    envvar="S3_BUCKET",
+    default="ppworker",
+    help="S3 bucket name for audio uploads (default: ppworker, can also use S3_BUCKET env var)",
+)
+@click.option(
+    "--s3-region",
+    envvar="S3_REGION",
+    default="us-east-1",
+    help="S3 region (default: us-east-1, can also use S3_REGION env var)",
+)
 def worker(
     manager,
     worker_id,
@@ -84,6 +112,11 @@ def worker(
     all_gpus,
     gpus,
     verbose,
+    s3_endpoint,
+    s3_access_key,
+    s3_secret_key,
+    s3_bucket,
+    s3_region,
 ):
     """Run a worker to process jobs."""
     # Setup logging
@@ -166,6 +199,11 @@ def worker(
                     poll_interval,
                     gpu_id,
                     verbose,
+                    s3_endpoint,
+                    s3_access_key,
+                    s3_secret_key,
+                    s3_bucket,
+                    s3_region,
                 ),
             )
             p.start()
@@ -202,6 +240,11 @@ def worker(
             poll_interval,
             gpu_id,
             verbose,
+            s3_endpoint,
+            s3_access_key,
+            s3_secret_key,
+            s3_bucket,
+            s3_region,
         )
 
 
@@ -217,6 +260,11 @@ def _run_single_worker(
     poll_interval,
     gpu_id,
     verbose,
+    s3_endpoint,
+    s3_access_key,
+    s3_secret_key,
+    s3_bucket,
+    s3_region,
 ):
     """Run a single worker instance"""
     import logging
@@ -242,6 +290,20 @@ def _run_single_worker(
     click.echo(f"  Mode: {'Single job' if once else 'Continuous'}")
     click.echo()
 
+    # Create S3 config if credentials are provided
+    s3_config = None
+    if s3_access_key and s3_secret_key:
+        s3_config = {
+            "endpoint_url": s3_endpoint,
+            "access_key_id": s3_access_key,
+            "secret_access_key": s3_secret_key,
+            "bucket": s3_bucket,
+            "region": s3_region,
+        }
+        click.echo(f"  S3 uploads: Enabled (bucket: {s3_bucket})")
+    else:
+        click.echo("  S3 uploads: Disabled (no credentials provided)")
+
     # Create worker instance
     try:
         worker_instance = PodcastPileWorker(
@@ -253,6 +315,7 @@ def _run_single_worker(
             gpu_id=gpu_id,
             languages=languages,
             batch_size=batch_size,
+            s3_config=s3_config,
         )
     except Exception as e:
         click.echo(f"Error creating worker: {e}", err=True)
