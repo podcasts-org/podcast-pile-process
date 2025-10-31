@@ -368,7 +368,7 @@ class AudioProcessor:
                         f"Segment {i}: '{transcriptions[i][:50] if transcriptions[i] else '(empty)'}'..."
                     )
 
-            # BGM classification for all segments (batched)
+            # BGM classification for all segments (BATCHED for GPU efficiency)
             logger.info(f"Classifying BGM for {len(temp_files)} segments...")
 
             # Load all segment audio files
@@ -392,35 +392,40 @@ class AudioProcessor:
                     logger.warning(f"Failed to load audio for BGM classification: {e}")
                     audio_inputs.append(None)
 
-            # Batch classify with progress bar
-            for i in tqdm(
-                range(len(audio_inputs)),
-                desc="Classifying BGM",
-                unit="segment",
-                dynamic_ncols=True,
-            ):
-                try:
-                    if audio_inputs[i] is None:
+            # Process in batches for GPU efficiency
+            try:
+                # Filter out None values and track indices
+                valid_inputs = []
+                valid_indices = []
+                for i, audio_input in enumerate(audio_inputs):
+                    if audio_input is not None:
+                        valid_inputs.append(audio_input)
+                        valid_indices.append(i)
+                    else:
                         results[i]["bgm_probability"] = 0.0
                         results[i]["bgm"] = False
-                        continue
 
-                    predictions = self.bgm_classifier(audio_inputs[i])
+                # Batch classify all valid inputs at once
+                if valid_inputs:
+                    batch_predictions = self.bgm_classifier(valid_inputs, batch_size=32)
 
-                    # Extract BGM probability
-                    bgm_prob = 0.0
-                    for pred in predictions:
-                        if pred["label"] == "bgm":
-                            bgm_prob = pred["score"]
-                            break
+                    # Map predictions back to results
+                    for idx, predictions in zip(valid_indices, batch_predictions):
+                        bgm_prob = 0.0
+                        for pred in predictions:
+                            if pred["label"] == "bgm":
+                                bgm_prob = pred["score"]
+                                break
+                        results[idx]["bgm_probability"] = bgm_prob
+                        results[idx]["bgm"] = bgm_prob > 0.5
 
-                    results[i]["bgm_probability"] = bgm_prob
-                    results[i]["bgm"] = bgm_prob > 0.5
-
-                except Exception as e:
-                    logger.warning(f"BGM classification failed for segment {i}: {e}")
-                    results[i]["bgm_probability"] = 0.0
-                    results[i]["bgm"] = False
+                logger.info(f"✓ Classified {len(valid_inputs)} segments")
+            except Exception as e:
+                logger.warning(f"Batch BGM classification failed: {e}, falling back to defaults")
+                for i in range(len(results)):
+                    if "bgm_probability" not in results[i]:
+                        results[i]["bgm_probability"] = 0.0
+                        results[i]["bgm"] = False
 
         finally:
             # Clean up temporary files
@@ -800,12 +805,13 @@ class PodcastPileWorker:
             lines.append(f"{start:.2f} {end:.2f} speaker_{speaker}")
         return "\n".join(lines)
 
-    def process_job(self, job: Dict) -> bool:
+    def process_job(self, job: Dict, next_job: Optional[Dict] = None) -> bool:
         """
-        Process a single job
+        Process a single job, optionally prefetching next job's audio
 
         Args:
             job: Job dict from manager
+            next_job: Optional next job to prefetch audio for
 
         Returns:
             True if successful
@@ -822,9 +828,33 @@ class PodcastPileWorker:
         temp_dir = tempfile.mkdtemp()
         upload_thread = None
 
+        # Prefetch state for next job
+        next_temp_dir = None
+        next_audio_path = None
+        next_download_thread = None
+
         try:
-            # Download audio
-            audio_path = self.download_audio(episode_url, temp_dir)
+            # Check if audio was prefetched
+            if job.get("_prefetch_audio_path"):
+                # Wait for prefetch to complete
+                prefetch_thread = job.get("_prefetch_thread")
+                if prefetch_thread and prefetch_thread.is_alive():
+                    logger.info("Waiting for prefetched download to complete...")
+                    prefetch_thread.join()
+
+                audio_path = job.get("_prefetch_audio_path")
+                temp_dir = job.get("_prefetch_temp_dir")
+
+                if audio_path and os.path.exists(audio_path):
+                    logger.info(f"✓ Using prefetched audio: {audio_path}")
+                else:
+                    # Prefetch failed, download normally
+                    logger.warning("Prefetch failed, downloading audio now...")
+                    temp_dir = tempfile.mkdtemp()
+                    audio_path = self.download_audio(episode_url, temp_dir)
+            else:
+                # No prefetch, download normally
+                audio_path = self.download_audio(episode_url, temp_dir)
 
             # Start S3 upload in background if configured
             if self.s3_uploader:
@@ -840,7 +870,29 @@ class PodcastPileWorker:
                 audio_path, episode_url=episode_url, language=language
             )
 
-            # Submit results
+            # Start downloading next job's audio BEFORE submitting results
+            # This overlaps download I/O with result submission network I/O
+            if next_job:
+                next_temp_dir = tempfile.mkdtemp()
+                next_episode_url = next_job["episode_url"]
+
+                def download_next():
+                    nonlocal next_audio_path
+                    try:
+                        logger.info(f"⏩ Prefetching audio for job #{next_job['job_id']}...")
+                        next_audio_path = self.download_audio(next_episode_url, next_temp_dir)
+                        logger.info(f"✓ Prefetched audio for job #{next_job['job_id']}")
+
+                        # Pre-convert to mono if needed (CPU work during I/O time)
+                        next_audio_path = self.processor.convert_to_mono_if_needed(next_audio_path)
+                        logger.info(f"✓ Pre-converted audio to mono if needed")
+                    except Exception as e:
+                        logger.warning(f"Failed to prefetch audio: {e}")
+
+                next_download_thread = threading.Thread(target=download_next, daemon=True)
+                next_download_thread.start()
+
+            # Submit results (network I/O happens here)
             success = self.submit_results(job_id, results)
 
             # Wait for S3 upload to complete before finishing
@@ -849,11 +901,22 @@ class PodcastPileWorker:
                 upload_thread.join()
                 logger.info("S3 upload thread finished")
 
+            # Store prefetch results for next iteration
+            if next_download_thread:
+                # Attach prefetch info to the job object for next iteration
+                next_job["_prefetch_temp_dir"] = next_temp_dir
+                next_job["_prefetch_audio_path"] = next_audio_path
+                next_job["_prefetch_thread"] = next_download_thread
+
             return success
 
         except Exception as e:
             logger.error(f"Error processing job #{job_id}: {e}", exc_info=True)
             self.report_failure(job_id, str(e))
+            # Clean up next job prefetch on error
+            if next_temp_dir:
+                import shutil
+                shutil.rmtree(next_temp_dir, ignore_errors=True)
             return False
 
         finally:
@@ -882,7 +945,7 @@ class PodcastPileWorker:
 
     def run_loop(self, languages: str = "en", poll_interval: int = 10):
         """
-        Continuously request and process jobs
+        Continuously request and process jobs with prefetching
 
         Args:
             languages: Comma-separated language codes (default: "en")
@@ -893,15 +956,48 @@ class PodcastPileWorker:
         logger.info(f"Starting worker loop (languages: {languages})...")
         logger.info("Press Ctrl+C to stop")
 
+        next_job = None
+        prefetch_thread = None
+
+        def prefetch_job():
+            """Fetch next job in background"""
+            return self.request_job(languages=languages)
+
         try:
             while True:
-                job = self.request_job(languages=languages)
+                # Use prefetched job if available, otherwise fetch now
+                if next_job:
+                    job = next_job
+                    logger.info(f"Using prefetched job #{job['job_id']}")
+                    next_job = None
+                else:
+                    job = self.request_job(languages=languages)
 
                 if job:
-                    self.process_job(job)
+                    # Start prefetching next job in background thread
+                    # This overlaps network I/O with GPU processing
+                    prefetch_thread = threading.Thread(target=lambda: None, daemon=True)
+
+                    def fetch_wrapper():
+                        nonlocal next_job
+                        next_job = prefetch_job()
+                        if next_job:
+                            logger.info(f"✓ Prefetched job #{next_job['job_id']}")
+
+                    prefetch_thread = threading.Thread(target=fetch_wrapper, daemon=True)
+                    prefetch_thread.start()
+
+                    # Wait for prefetch to complete before processing
+                    # This ensures we can start downloading next audio ASAP
+                    if prefetch_thread:
+                        prefetch_thread.join(timeout=5)  # Don't wait forever
+
+                    # Process current job, passing next job for audio prefetching
+                    self.process_job(job, next_job=next_job)
                 else:
                     logger.info(f"No jobs available, waiting {poll_interval}s...")
                     time.sleep(poll_interval)
+                    next_job = None  # Clear any stale prefetch
 
         except KeyboardInterrupt:
             logger.info("\nStopping worker...")
