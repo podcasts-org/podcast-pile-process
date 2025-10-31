@@ -290,7 +290,7 @@ def _run_single_worker(
 
 @cli.command()
 @click.argument("url")
-@click.option("-m", "--manager", default="http://localhost:8000", help="Manager URL")
+@click.option("-m", "--manager", default="https://podcastpile.mrfake.name", help="Manager URL")
 @click.option("--language", help="Language code (e.g., en, es, fr)")
 def create(url, manager, language):
     """Create a new job."""
