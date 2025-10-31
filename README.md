@@ -17,7 +17,7 @@ Workers download episodes from their URLs, perform diarization using Nvidia NeMo
 For running the manager server only (no worker):
 
 ```bash
-pip install -e .
+pip install -U podcastpile
 ```
 
 ### Worker
@@ -25,7 +25,7 @@ pip install -e .
 For running a worker, you need additional ML dependencies:
 
 ```bash
-pip install -e ".[worker]"
+pip install -U "podcastpile[worker]"
 ```
 
 This will install:

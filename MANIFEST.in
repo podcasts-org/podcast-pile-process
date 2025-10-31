@@ -5,4 +5,4 @@ recursive-include src/podcastpile/templates *.html
 recursive-include src/podcastpile *.py
 global-exclude *.pyc
 global-exclude __pycache__
-prune src/*.egg-info
+global-exclude *.egg-info/*

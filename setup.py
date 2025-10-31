@@ -1,4 +1,10 @@
+from pathlib import Path
+
 from setuptools import find_packages, setup
+
+# Read README for long description
+this_directory = Path(__file__).parent
+long_description = (this_directory / "README.md").read_text()
 
 setup(
     name="podcastpile",
@@ -6,6 +12,8 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     include_package_data=True,
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     install_requires=[
         # Manager dependencies
         "fastapi>=0.104.0",
