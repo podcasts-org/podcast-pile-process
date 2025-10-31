@@ -198,7 +198,6 @@ class AudioProcessor:
             self.bgm_classifier = pipeline(
                 "audio-classification",
                 model="podcasts-org/detect-background-music",
-                token="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",  # Repo-specific access
                 device=self.gpu_id if self.gpu_id is not None else -1,
             )
             logger.info("✓ BGM classifier loaded")
