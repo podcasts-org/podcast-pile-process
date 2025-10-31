@@ -15,6 +15,10 @@ from .auth import get_client_ip, verify_admin_auth, verify_worker_auth
 
 app = FastAPI(title="Podcast Pile Manager", version="0.1.0")
 
+# Cache for dashboard data (refreshed every 30 seconds)
+_dashboard_cache = {"data": None, "timestamp": None}
+_CACHE_TTL = 30  # seconds
+
 # Get the templates directory
 TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates")
 templates = Jinja2Templates(directory=TEMPLATES_DIR)
@@ -396,43 +400,49 @@ async def fail_job(
 async def get_chart_data(
     db: Session = Depends(get_db), _: str = Depends(verify_admin_auth)
 ):
-    """Get data for dashboard charts (optimized for large datasets)."""
+    """Get data for dashboard charts (optimized for large datasets with caching)."""
     from datetime import timedelta
 
+    # Check cache first
     now = datetime.utcnow()
+    if _dashboard_cache["timestamp"] and (now - _dashboard_cache["timestamp"]).total_seconds() < _CACHE_TTL:
+        return _dashboard_cache["data"]
+
     last_24h = now - timedelta(hours=24)
 
-    # Throughput: jobs completed per hour (only query completed_at, not full rows)
+    # Throughput: Use DB aggregation with hourly grouping (much faster than fetching all rows)
     # Uses index: ix_status_completed
-    completed_jobs = (
-        db.query(Job.completed_at)
+    hourly_counts_raw = (
+        db.query(
+            func.strftime('%Y-%m-%d %H:00:00', Job.completed_at).label('hour'),
+            func.count(Job.id).label('count')
+        )
         .filter(Job.status == JobStatus.COMPLETED, Job.completed_at >= last_24h)
+        .group_by(func.strftime('%Y-%m-%d %H:00:00', Job.completed_at))
         .all()
     )
 
-    # Group by hour
-    hourly_counts = {}
-    for (completed_at,) in completed_jobs:
-        hour_key = completed_at.replace(minute=0, second=0, microsecond=0)
-        hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
+    # Convert to dict for fast lookup
+    hourly_counts = {hour: count for hour, count in hourly_counts_raw}
 
     throughput_labels = []
     throughput_data = []
     for i in range(24):
         hour = now - timedelta(hours=23 - i)
-        hour_key = hour.replace(minute=0, second=0, microsecond=0)
-        throughput_labels.append(hour_key.strftime("%H:%M"))
+        hour_key = hour.strftime("%Y-%m-%d %H:00:00")
+        throughput_labels.append(hour.strftime("%H:%M"))
         throughput_data.append(hourly_counts.get(hour_key, 0))
 
-    # Worker performance: jobs completed per worker (aggregated in DB)
+    # Worker performance: jobs completed per worker (aggregated in DB, only top 50)
     # Uses index: ix_worker_status
     worker_stats = (
         db.query(Job.worker_id, func.count(Job.id).label("completed_count"))
         .filter(Job.status == JobStatus.COMPLETED, Job.worker_id.isnot(None))
         .group_by(Job.worker_id)
+        .order_by(func.count(Job.id).desc())
         .limit(50)
         .all()
-    )  # Limit to top 50 workers
+    )
 
     worker_labels = [w[0] for w in worker_stats]
     worker_data = [w[1] for w in worker_stats]
@@ -459,26 +469,28 @@ async def get_chart_data(
         avg_times.append(round(processing_time, 2))
         avg_time_labels.append(f"#{job_id}")
 
-    # Overall average processing time: Use SQL AVG for efficiency
-    # Calculate average using database-level aggregation (much faster)
-    avg_result = (
-        db.query(
-            func.avg(
-                func.julianday(Job.completed_at) - func.julianday(Job.assigned_at)
-            ).label("avg_days")
-        )
+    # Overall average processing time: Calculate from recent 10k jobs for speed
+    # Uses primary key index for fast retrieval
+    recent_jobs_for_avg = (
+        db.query(Job.assigned_at, Job.completed_at)
         .filter(
             Job.status == JobStatus.COMPLETED,
             Job.assigned_at.isnot(None),
             Job.completed_at.isnot(None),
         )
-        .first()
+        .order_by(Job.id.desc())
+        .limit(10000)
+        .all()
     )
 
-    # Convert from days to minutes
+    # Calculate average in Python (small dataset)
     total_avg_time = 0
-    if avg_result and avg_result[0]:
-        total_avg_time = round(avg_result[0] * 24 * 60, 2)
+    if recent_jobs_for_avg:
+        total_seconds = sum(
+            (completed - assigned).total_seconds()
+            for assigned, completed in recent_jobs_for_avg
+        )
+        total_avg_time = round((total_seconds / len(recent_jobs_for_avg)) / 60, 2)
 
     # Status distribution: Use single query with grouping
     status_counts_query = (
@@ -491,13 +503,19 @@ async def get_chart_data(
         status.value: count for status, count in status_counts_query if count > 0
     }
 
-    return {
+    result = {
         "throughput": {"labels": throughput_labels, "data": throughput_data},
         "workers": {"labels": worker_labels, "data": worker_data},
         "processing_times": {"labels": avg_time_labels, "data": avg_times},
         "avg_processing_time": total_avg_time,
         "status_distribution": status_counts,
     }
+
+    # Update cache
+    _dashboard_cache["data"] = result
+    _dashboard_cache["timestamp"] = now
+
+    return result
 
 
 @app.get("/jobs", response_class=HTMLResponse)
