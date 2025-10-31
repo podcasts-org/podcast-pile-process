@@ -110,6 +110,7 @@ class AudioProcessor:
         self.asr_model = None  # Parakeet (English)
         self.zh_asr_model = None  # Paraformer (Chinese)
         self.bgm_classifier = None  # BGM detection
+        self.bgm_model_id = "podcasts-org/detect-background-music"  # HF model ID
         self.model_path = model_path
 
     def load_models(self):
@@ -197,10 +198,10 @@ class AudioProcessor:
 
             self.bgm_classifier = pipeline(
                 "audio-classification",
-                model="podcasts-org/detect-background-music",
+                model=self.bgm_model_id,
                 device=self.gpu_id if self.gpu_id is not None else -1,
             )
-            logger.info("✓ BGM classifier loaded")
+            logger.info(f"✓ BGM classifier loaded ({self.bgm_model_id})")
         except Exception as e:
             logger.error(f"Failed to load BGM classifier: {e}")
             raise
@@ -442,6 +443,7 @@ class AudioProcessor:
             "num_speakers": len(set(s["speaker"] for s in results)),
             "processing_time": processing_time,
             "gpu_info": gpu_info,
+            "bgm_model": self.bgm_model_id,
             "processed_at": datetime.utcnow().isoformat() + "Z",
         }
 

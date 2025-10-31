@@ -223,3 +223,6 @@ __marimo__/
 
 # Import data (get it at https://huggingface.co/datasets/podcasts-org/podcast_pile_subsets_1m_5m_balanced/blob/main/bal_1m.jsonl)
 input.jsonl
+
+# Claude
+.claude/
