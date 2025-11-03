@@ -256,38 +256,44 @@ class AudioProcessor:
         return {"sha256": sha256_hash.hexdigest(), "md5": md5_hash.hexdigest()}
 
     def diarize_audio(
-        self, audio_path: str, episode_url: str = None, language: str = None
+        self, audio_path: str, episode_url: str = None, language: str = None,
+        converted_audio_path: str = None
     ) -> Dict:
         """
         Diarize a single audio file and return results
 
         Args:
-            audio_path: Path to audio file
+            audio_path: Path to original audio file (used for hashing)
             episode_url: Original episode URL
             language: Language code
+            converted_audio_path: Optional pre-converted mono audio path (from prefetch)
 
         Returns:
             Dict with diarization results, transcriptions, file hashes, and metadata
         """
         start_time = time.time()
-        # Compute hashes first (before any conversion)
+        # Compute hashes on the ORIGINAL audio file (before any conversion)
         logger.info(f"Computing file hashes for {audio_path}...")
         hashes = self.compute_file_hashes(audio_path)
         logger.info(f"SHA256: {hashes['sha256']}")
         logger.info(f"MD5: {hashes['md5']}")
 
-        # Convert to mono if needed
-        audio_path = self.convert_to_mono_if_needed(audio_path)
+        # Use pre-converted path if provided, otherwise convert now
+        if converted_audio_path:
+            logger.info(f"Using pre-converted audio: {converted_audio_path}")
+            processing_audio_path = converted_audio_path
+        else:
+            processing_audio_path = self.convert_to_mono_if_needed(audio_path)
 
         # Get audio duration
-        audio, sr = librosa.load(audio_path, sr=16000, mono=True)
+        audio, sr = librosa.load(processing_audio_path, sr=16000, mono=True)
         duration = len(audio) / sr
 
         logger.info(f"Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
 
         # Perform diarization
         logger.info("Diarizing...")
-        segments = self.diar_model.diarize(audio=audio_path, batch_size=1)
+        segments = self.diar_model.diarize(audio=processing_audio_path, batch_size=1)
 
         # Parse segments into structured format
         results = []
@@ -842,8 +848,16 @@ class PodcastPileWorker:
                     logger.info("Waiting for prefetched download to complete...")
                     prefetch_thread.join()
 
-                audio_path = job.get("_prefetch_audio_path")
+                prefetch_data = job.get("_prefetch_audio_path")
                 temp_dir = job.get("_prefetch_temp_dir")
+
+                # Handle both tuple (new format) and string (old format for backward compatibility)
+                if isinstance(prefetch_data, tuple):
+                    original_audio_path, audio_path = prefetch_data
+                else:
+                    # Old format: single path (both are the same)
+                    original_audio_path = prefetch_data
+                    audio_path = prefetch_data
 
                 if audio_path and os.path.exists(audio_path):
                     logger.info(f"✓ Using prefetched audio: {audio_path}")
@@ -852,22 +866,29 @@ class PodcastPileWorker:
                     logger.warning("Prefetch failed, downloading audio now...")
                     temp_dir = tempfile.mkdtemp()
                     audio_path = self.download_audio(episode_url, temp_dir)
+                    original_audio_path = audio_path
             else:
                 # No prefetch, download normally
                 audio_path = self.download_audio(episode_url, temp_dir)
+                original_audio_path = audio_path
 
             # Start S3 upload in background if configured
             if self.s3_uploader:
-                # Compute hash for the audio file
-                file_hash = self.processor.compute_file_hashes(audio_path)["sha256"]
+                # Compute hash for the ORIGINAL audio file (not converted)
+                file_hash = self.processor.compute_file_hashes(original_audio_path)["sha256"]
                 upload_thread = self.s3_uploader.upload_file_threaded(
-                    audio_path, file_hash
+                    original_audio_path, file_hash
                 )
                 logger.info("S3 upload started in background thread")
 
             # Process audio with metadata (GPU work happens here)
+            # Pass original path for hashing and converted path for processing (if available from prefetch)
+            converted_path = audio_path if audio_path != original_audio_path else None
             results = self.processor.diarize_audio(
-                audio_path, episode_url=episode_url, language=language
+                original_audio_path,
+                episode_url=episode_url,
+                language=language,
+                converted_audio_path=converted_path
             )
 
             # Start downloading next job's audio BEFORE submitting results
@@ -880,12 +901,15 @@ class PodcastPileWorker:
                     nonlocal next_audio_path
                     try:
                         logger.info(f"⏩ Prefetching audio for job #{next_job['job_id']}...")
-                        next_audio_path = self.download_audio(next_episode_url, next_temp_dir)
+                        original_audio_path = self.download_audio(next_episode_url, next_temp_dir)
                         logger.info(f"✓ Prefetched audio for job #{next_job['job_id']}")
 
                         # Pre-convert to mono if needed (CPU work during I/O time)
-                        next_audio_path = self.processor.convert_to_mono_if_needed(next_audio_path)
+                        converted_audio_path = self.processor.convert_to_mono_if_needed(original_audio_path)
                         logger.info(f"✓ Pre-converted audio to mono if needed")
+
+                        # Store both paths: we need the converted for processing, original for hashing
+                        next_audio_path = (original_audio_path, converted_audio_path)
                     except Exception as e:
                         logger.warning(f"Failed to prefetch audio: {e}")
 
