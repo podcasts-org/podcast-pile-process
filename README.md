@@ -2,6 +2,10 @@
 
 Data processing infra for Podcast Pile. [Manager server](https://podcastpile.mrfake.name/)
 
+## Notes
+
+- [ ] Can clean up audio files in S3 that do not belong to any job. (due to reprocessing due to prefetch bug)
+
 ## Architecture
 
 The manager server maintains a queue of episodes to process. Worker servers request jobs from the manager, which assigns them tasks. Workers then process their assigned jobs and return results (transcription, diarization, and metadata) to the manager, which stores them in the database.

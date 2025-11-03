@@ -1,4 +1,65 @@
-# Import Scripts
+# Podserver Scripts
+
+Administrative and utility scripts for managing the Podcast Pile system.
+
+## invalidate_recent_jobs.py
+
+Invalidate and mark for reprocessing all jobs processed after a specific date. This is useful when a bug in the worker processing code is discovered and completed jobs need to be reprocessed.
+
+### Usage
+
+**Dry run (default)** - Shows what would be invalidated without making changes:
+```bash
+python scripts/invalidate_recent_jobs.py --after "2025-10-29"
+```
+
+**Execute the invalidation:**
+```bash
+python scripts/invalidate_recent_jobs.py --after "2025-10-29" --execute
+```
+
+**With verbose output:**
+```bash
+python scripts/invalidate_recent_jobs.py --after "2025-10-29" --verbose --execute
+```
+
+**Specify a datetime with time component:**
+```bash
+python scripts/invalidate_recent_jobs.py --after "2025-10-29 15:30:00" --execute
+```
+
+### What it does
+
+1. Queries the database for all jobs with status `COMPLETED` that were processed after the specified date
+2. Resets these jobs to `PENDING` status
+3. Clears all processing results (transcription, diarization, result_json)
+4. Clears worker assignment information
+5. Adds a note to the error_message field documenting the invalidation
+6. Increments the retry_count to track reprocessing
+
+### Options
+
+- `--after DATE`: **(Required)** Invalidate jobs processed after this date. Accepts formats:
+  - `YYYY-MM-DD`
+  - `YYYY-MM-DD HH:MM:SS`
+  - `YYYY-MM-DD HH:MM`
+  - `YYYY/MM/DD`
+  - `YYYY/MM/DD HH:MM:SS`
+
+- `--execute`: Actually perform the invalidation. Without this flag, the script runs in dry-run mode.
+
+- `--verbose` / `-v`: Show detailed information about each job.
+
+### Safety Features
+
+- **Dry-run by default**: Won't make changes unless you use `--execute`
+- **Detailed reporting**: Shows affected jobs grouped by podcast
+- **Preserves history**: Documents invalidation in error_message field
+- **Transaction safety**: Uses database transactions with rollback on error
+
+---
+
+## Import Scripts
 
 Fast bulk import tools for loading large JSONL files into the Podcast Pile database.
 
