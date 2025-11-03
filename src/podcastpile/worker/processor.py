@@ -483,37 +483,24 @@ class AudioProcessor:
                         results[i]["quality_coloration"] = None
                         results[i]["quality_loudness"] = None
 
-                # Process in batches to avoid OOM
-                nisqa_batch_size = 32
-                for batch_start in range(0, len(nisqa_tensors), nisqa_batch_size):
-                    batch_end = min(batch_start + nisqa_batch_size, len(nisqa_tensors))
-                    batch_tensors = nisqa_tensors[batch_start:batch_end]
-                    batch_indices = nisqa_indices[batch_start:batch_end]
-
-                    # Stack tensors - pad to same length if needed
-                    max_len = max(t.shape[0] for t in batch_tensors)
-                    padded_tensors = []
-                    for t in batch_tensors:
-                        if t.shape[0] < max_len:
-                            # Pad with zeros
-                            padding = torch.zeros(max_len - t.shape[0], device=device, dtype=torch.float32)
-                            t = torch.cat([t, padding])
-                        padded_tensors.append(t)
-
-                    batch_tensor = torch.stack(padded_tensors)
-
-                    # Run NISQA on batch
+                # Process segments individually (NISQA doesn't support batching)
+                for idx, audio_tensor in zip(nisqa_indices, nisqa_tensors):
+                    # Run NISQA on single audio segment
                     with torch.no_grad():
-                        # NISQA returns: (mos, noisiness, discontinuity, coloration, loudness)
-                        mos, noisiness, discontinuity, coloration, loudness = tm_nisqa(batch_tensor, 16000)
+                        # NISQA returns a tensor with 5 values
+                        nisqa_result = tm_nisqa(audio_tensor, 16000)
+                        # Convert to list: [mos, noisiness, discontinuity, coloration, loudness]
+                        scores = nisqa_result.detach().cpu().numpy().tolist()
 
-                    # Map results back to segments
-                    for i, idx in enumerate(batch_indices):
-                        results[idx]["quality_mos"] = float(mos[i].cpu().item())
-                        results[idx]["quality_noisiness"] = float(noisiness[i].cpu().item())
-                        results[idx]["quality_discontinuity"] = float(discontinuity[i].cpu().item())
-                        results[idx]["quality_coloration"] = float(coloration[i].cpu().item())
-                        results[idx]["quality_loudness"] = float(loudness[i].cpu().item())
+                        # Unpack the 5 scores
+                        mos, noisiness, discontinuity, coloration, loudness = scores
+
+                    # Store results
+                    results[idx]["quality_mos"] = float(mos)
+                    results[idx]["quality_noisiness"] = float(noisiness)
+                    results[idx]["quality_discontinuity"] = float(discontinuity)
+                    results[idx]["quality_coloration"] = float(coloration)
+                    results[idx]["quality_loudness"] = float(loudness)
 
                 logger.info(f"✓ Assessed quality for {len(nisqa_tensors)} segments")
 
@@ -548,10 +535,10 @@ class AudioProcessor:
         quality_coloration_scores = [s.get("quality_coloration") for s in results if s.get("quality_coloration") is not None]
         quality_loudness_scores = [s.get("quality_loudness") for s in results if s.get("quality_loudness") is not None]
 
-        # Clipping and loudness aggregations
+        # Clipping and loudness aggregations (per-segment values)
         clip_rates = [s.get("clip_rate", 0.0) for s in results]
-        rms_db_values = [s.get("rms_db") for s in results if s.get("rms_db") is not None]
-        peak_db_values = [s.get("peak_db") for s in results if s.get("peak_db") is not None]
+        rms_db_values = [s.get("rms_db") for s in results if s.get("rms_db") is not None and s.get("rms_db") != -100.0]
+        peak_db_values = [s.get("peak_db") for s in results if s.get("peak_db") is not None and s.get("peak_db") != -100.0]
         dynamic_range_values = [s.get("dynamic_range_db") for s in results if s.get("dynamic_range_db") is not None]
 
         episode_quality = {}
@@ -576,8 +563,8 @@ class AudioProcessor:
 
         # Clipping statistics
         clipping_stats = {
-            "mean_clip_rate": float(np.mean(clip_rates)),
-            "max_clip_rate": float(np.max(clip_rates)),
+            "mean_clip_rate": float(np.mean(clip_rates)) if clip_rates else 0.0,
+            "max_clip_rate": float(np.max(clip_rates)) if clip_rates else 0.0,
             "segments_with_clipping": sum(1 for s in results if s.get("has_clipping", False)),
             "total_clipped_samples": sum(s.get("clipped_samples", 0) for s in results),
         }
