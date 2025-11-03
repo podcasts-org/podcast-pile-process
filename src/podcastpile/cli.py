@@ -17,13 +17,18 @@ def cli():
 @click.option("-p", "--port", default=8000, help="Port to run on")
 @click.option("--host", default="0.0.0.0", help="Host to bind to")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
-def manager(port, host, reload):
+@click.option("-w", "--workers", default=4, type=int, help="Number of worker processes (default: 4, ignored with --reload)")
+def manager(port, host, reload, workers):
     """Run the manager server."""
     # Load environment variables from .env file
     load_dotenv()
 
-    click.echo(f"Starting Podcast Pile Manager on {host}:{port}...")
-    uvicorn.run("podcastpile.manager.server:app", host=host, port=port, reload=reload)
+    if reload:
+        click.echo(f"Starting Podcast Pile Manager on {host}:{port} (reload mode, single worker)...")
+        uvicorn.run("podcastpile.manager.server:app", host=host, port=port, reload=reload)
+    else:
+        click.echo(f"Starting Podcast Pile Manager on {host}:{port} with {workers} workers...")
+        uvicorn.run("podcastpile.manager.server:app", host=host, port=port, workers=workers)
 
 
 @cli.command()
