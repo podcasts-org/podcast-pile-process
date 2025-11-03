@@ -115,10 +115,10 @@ async def dashboard(
 
     recent_other_jobs = []
     if remaining_needed > 0:
-        query = db.query(Job).order_by(Job.id.desc()).limit(remaining_needed)
+        query = db.query(Job).order_by(Job.id.desc())
         if processing_ids:
             query = query.filter(Job.id.notin_(processing_ids))
-        recent_other_jobs = query.all()
+        recent_other_jobs = query.limit(remaining_needed).all()
 
     recent_jobs = processing_jobs + recent_other_jobs
 
