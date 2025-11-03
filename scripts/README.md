@@ -77,6 +77,98 @@ The script uses **batched processing** to efficiently handle large datasets:
 
 ---
 
+## cleanup.py
+
+Clean up stuck jobs that have been processing for too long. This script finds jobs in `PROCESSING` or `ASSIGNED` status that have exceeded their timeout and resets them to `PENDING` so they can be picked up again.
+
+### Usage
+
+**Dry run (default)** - Shows what would be cleaned up:
+```bash
+python scripts/cleanup.py
+```
+
+**Execute the cleanup:**
+```bash
+python scripts/cleanup.py --execute
+```
+
+**Custom timeout** (default is 2 hours):
+```bash
+python scripts/cleanup.py --timeout 4 --execute
+```
+
+**Clean up only specific status:**
+```bash
+# Only PROCESSING jobs
+python scripts/cleanup.py --status PROCESSING --execute
+
+# Only ASSIGNED jobs
+python scripts/cleanup.py --status ASSIGNED --execute
+```
+
+**With verbose output:**
+```bash
+python scripts/cleanup.py --verbose
+```
+
+### What it does
+
+1. Finds jobs in `PROCESSING` or `ASSIGNED` status that have been stuck for longer than the timeout
+2. Checks both:
+   - Jobs where `assigned_at` is older than the timeout
+   - Jobs where `expires_at` has passed (for jobs with explicit expiration)
+3. Resets these jobs to `PENDING` status
+4. Clears worker assignment information
+5. Documents the cleanup in `error_message` field for tracking
+6. Increments `retry_count` to track retries
+
+### When to use this
+
+- **Worker crashes**: Workers that crashed without reporting failures
+- **Network issues**: Workers that disconnected and couldn't complete jobs
+- **Stuck jobs**: Jobs that got stuck for unknown reasons
+- **Scheduled cleanup**: Run periodically (e.g., via cron) to automatically recover from failures
+
+### Options
+
+- `--timeout HOURS`: Reset jobs older than this many hours (default: 2.0)
+- `--execute`: Actually perform the cleanup (without this, it's dry-run)
+- `--status {PROCESSING,ASSIGNED,BOTH}`: Which status to check (default: BOTH)
+- `--batch-size N`: Jobs to process per batch (default: 1000)
+- `--verbose` / `-v`: Show detailed information about each job
+
+### Performance
+
+Uses the same batched processing approach as `invalidate_recent_jobs.py`:
+- Memory efficient: queries only essential fields
+- Batched commits: each batch committed separately
+- Progress reporting during execution
+- Fast dry-run: scans up to 10,000 jobs for statistics
+
+**Expected performance:**
+- Dry run: ~5,000-10,000 jobs/sec
+- Execution: ~500-2,000 jobs/sec
+
+### Running as a cron job
+
+You can schedule this to run automatically:
+
+```bash
+# Run every 30 minutes to clean up stuck jobs
+*/30 * * * * cd /path/to/podserver && python scripts/cleanup.py --execute >> /var/log/podserver-cleanup.log 2>&1
+```
+
+### Safety Features
+
+- **Dry-run by default**: Won't make changes without `--execute`
+- **Batched commits**: Reduces risk of long-running transactions
+- **Detailed reporting**: Shows affected jobs grouped by status and worker
+- **Preserves history**: Documents cleanup in error_message field
+- **Transaction safety**: Rollback on error
+
+---
+
 ## Import Scripts
 
 Fast bulk import tools for loading large JSONL files into the Podcast Pile database.

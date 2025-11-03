@@ -25,6 +25,9 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
+# Worker version - increment when making changes to processing logic
+WORKER_VERSION = "0.1.2"
+
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
     """Get GPU device information"""
@@ -458,6 +461,7 @@ class AudioProcessor:
             "processing_time": processing_time,
             "gpu_info": gpu_info,
             "bgm_model": self.bgm_model_id,
+            "worker_version": WORKER_VERSION,
             "processed_at": datetime.utcnow().isoformat() + "Z",
         }
 
