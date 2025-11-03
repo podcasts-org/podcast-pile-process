@@ -51,13 +51,14 @@ def parse_datetime(date_string: str) -> datetime:
     )
 
 
-def invalidate_jobs(cutoff_date: datetime, dry_run: bool = True) -> dict:
+def invalidate_jobs(cutoff_date: datetime, dry_run: bool = True, batch_size: int = 1000) -> dict:
     """
-    Invalidate jobs processed after the cutoff date.
+    Invalidate jobs processed after the cutoff date using batched processing.
 
     Args:
         cutoff_date: Jobs processed after this date will be invalidated
         dry_run: If True, only show what would be done without making changes
+        batch_size: Number of jobs to process per batch (default: 1000)
 
     Returns:
         Dictionary with statistics about the operation
@@ -69,16 +70,15 @@ def invalidate_jobs(cutoff_date: datetime, dry_run: bool = True) -> dict:
     db = next(get_db())
 
     try:
-        # Query for completed jobs processed after the cutoff date
+        # First, get count of jobs to invalidate (indexed query)
         # We check both completed_at and processed_at to be thorough
-        query = db.query(Job).filter(
+        count_query = db.query(func.count(Job.id)).filter(
             Job.status == JobStatus.COMPLETED,
             (Job.processed_at > cutoff_date) |
             ((Job.processed_at == None) & (Job.completed_at > cutoff_date))
         )
 
-        # Get count and sample of jobs
-        total_count = query.count()
+        total_count = count_query.scalar()
 
         if total_count == 0:
             return {
@@ -88,61 +88,110 @@ def invalidate_jobs(cutoff_date: datetime, dry_run: bool = True) -> dict:
                 "jobs": []
             }
 
-        # Get all matching jobs
-        jobs_to_invalidate = query.all()
+        print(f"Found {total_count} jobs to process...")
 
-        # Collect job information
+        # Query for job IDs only (much more memory efficient)
+        # Use order_by for consistent pagination
+        base_query = db.query(Job.id, Job.podcast_id, Job.episode_url,
+                             Job.completed_at, Job.processed_at, Job.worker_id).filter(
+            Job.status == JobStatus.COMPLETED,
+            (Job.processed_at > cutoff_date) |
+            ((Job.processed_at == None) & (Job.completed_at > cutoff_date))
+        ).order_by(Job.id)
+
+        # Collect lightweight job info for reporting
         job_info = []
-        for job in jobs_to_invalidate:
-            info = {
-                "id": job.id,
-                "episode_url": job.episode_url,
-                "podcast_id": job.podcast_id,
-                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
-                "processed_at": job.processed_at.isoformat() if job.processed_at else None,
-                "worker_id": job.worker_id,
-            }
-            job_info.append(info)
+        invalidated_count = 0
+
+        # Process in batches
+        offset = 0
+        while True:
+            # Fetch batch of job info
+            batch = base_query.limit(batch_size).offset(offset).all()
+
+            if not batch:
+                break
+
+            # Collect info for this batch
+            batch_ids = []
+            for job_data in batch:
+                job_id, podcast_id, episode_url, completed_at, processed_at, worker_id = job_data
+
+                info = {
+                    "id": job_id,
+                    "episode_url": episode_url,
+                    "podcast_id": podcast_id,
+                    "completed_at": completed_at.isoformat() if completed_at else None,
+                    "processed_at": processed_at.isoformat() if processed_at else None,
+                    "worker_id": worker_id,
+                }
+                job_info.append(info)
+                batch_ids.append(job_id)
 
             if not dry_run:
-                # Reset job to pending status
-                job.status = JobStatus.PENDING
-                job.worker_id = None
-                job.worker_ip = None
-                job.assigned_at = None
-                job.completed_at = None
-                job.expires_at = None
+                # Now fetch and update the actual Job objects for this batch
+                jobs_to_update = db.query(Job).filter(Job.id.in_(batch_ids)).all()
 
-                # Clear results but keep them in error_message for reference
-                old_error = job.error_message or ""
-                invalidation_note = (
-                    f"[INVALIDATED {datetime.utcnow().isoformat()}] "
-                    f"Job reprocessed due to worker bug. "
-                    f"Original completion: {job.completed_at}. "
-                )
-                if old_error:
-                    job.error_message = invalidation_note + "\nPrevious error: " + old_error
-                else:
-                    job.error_message = invalidation_note
+                invalidation_timestamp = datetime.utcnow().isoformat()
 
-                # Clear processing results
-                job.transcription = None
-                job.diarization = None
-                job.result_json = None
-                job.processing_duration = None
-                job.worker_gpu = None
-                job.processed_at = None
+                for job in jobs_to_update:
+                    # Store original completion time before modifying
+                    original_completion = job.completed_at
 
-                # Increment retry count to track this was reprocessed
-                job.retry_count = (job.retry_count or 0) + 1
+                    # Reset job to pending status
+                    job.status = JobStatus.PENDING
+                    job.worker_id = None
+                    job.worker_ip = None
+                    job.assigned_at = None
+                    job.completed_at = None
+                    job.expires_at = None
+
+                    # Clear results but document in error_message for reference
+                    old_error = job.error_message or ""
+                    invalidation_note = (
+                        f"[INVALIDATED {invalidation_timestamp}] "
+                        f"Job reprocessed due to worker bug. "
+                        f"Original completion: {original_completion}. "
+                    )
+                    if old_error:
+                        job.error_message = invalidation_note + "\nPrevious error: " + old_error
+                    else:
+                        job.error_message = invalidation_note
+
+                    # Clear processing results
+                    job.transcription = None
+                    job.diarization = None
+                    job.result_json = None
+                    job.processing_duration = None
+                    job.worker_gpu = None
+                    job.processed_at = None
+
+                    # Increment retry count to track this was reprocessed
+                    job.retry_count = (job.retry_count or 0) + 1
+
+                # Commit this batch
+                db.commit()
+                invalidated_count += len(batch_ids)
+
+                # Progress reporting
+                print(f"  Invalidated {invalidated_count:,} / {total_count:,} jobs...")
+
+            offset += batch_size
+
+            # Small optimization: if we're in dry-run and we've collected enough info, break
+            if dry_run and offset >= min(10000, total_count):
+                # Continue collecting metadata but don't load all jobs in dry-run
+                remaining = total_count - offset
+                if remaining > 0:
+                    print(f"  [Dry run: Scanned {offset:,} jobs, skipping detailed scan of remaining {remaining:,}]")
+                break
 
         if not dry_run:
-            db.commit()
-            print(f"✓ Successfully invalidated {total_count} jobs")
+            print(f"✓ Successfully invalidated {invalidated_count:,} jobs")
 
         return {
             "total_found": total_count,
-            "invalidated": total_count if not dry_run else 0,
+            "invalidated": invalidated_count if not dry_run else 0,
             "dry_run": dry_run,
             "jobs": job_info
         }
@@ -176,6 +225,12 @@ def main():
         action="store_true",
         help="Show detailed information about each job"
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1000,
+        help="Number of jobs to process per batch (default: 1000)"
+    )
 
     args = parser.parse_args()
 
@@ -188,10 +243,11 @@ def main():
 
     # Run the invalidation
     print(f"{'DRY RUN - ' if not args.execute else ''}Searching for jobs processed after {cutoff_date}")
+    print(f"Batch size: {args.batch_size}")
     print("-" * 80)
 
     try:
-        result = invalidate_jobs(cutoff_date, dry_run=not args.execute)
+        result = invalidate_jobs(cutoff_date, dry_run=not args.execute, batch_size=args.batch_size)
 
         print(f"\nFound {result['total_found']} jobs processed after {cutoff_date}")
 
