@@ -123,15 +123,15 @@ async def dashboard(
     recent_jobs = processing_jobs + recent_other_jobs
 
     # Get active workers count efficiently (uses index: ix_worker_status)
+    # Use func.count(distinct) which is faster than distinct().count()
     active_worker_count = (
-        db.query(Job.worker_id)
+        db.query(func.count(func.distinct(Job.worker_id)))
         .filter(
             Job.status.in_([JobStatus.ASSIGNED, JobStatus.PROCESSING]),
             Job.worker_id.isnot(None),
         )
-        .distinct()
-        .count()
-    )
+        .scalar()
+    ) or 0
 
     return templates.TemplateResponse(
         "dashboard.html",
