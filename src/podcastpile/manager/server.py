@@ -98,13 +98,29 @@ async def dashboard(
         "expired": stats_dict.get(JobStatus.EXPIRED.value, 0),
     }
 
-    # Get recent jobs (limit to 20, processing jobs first)
-    recent_jobs = (
+    # Get recent jobs (limit to 20, prioritize active jobs)
+    # OPTIMIZATION: Use UNION to avoid expensive conditional ordering on 2M rows
+    # First get processing jobs, then fill remaining slots with recent jobs
+    processing_jobs = (
         db.query(Job)
-        .order_by((Job.status == JobStatus.PROCESSING).desc(), Job.created_at.desc())
-        .limit(20)
+        .filter(Job.status == JobStatus.PROCESSING)
+        .order_by(Job.created_at.desc())
+        .limit(10)
         .all()
     )
+
+    # Get remaining slots with most recent jobs (excluding ones we already have)
+    processing_ids = [j.id for j in processing_jobs]
+    remaining_needed = 20 - len(processing_jobs)
+
+    recent_other_jobs = []
+    if remaining_needed > 0:
+        query = db.query(Job).order_by(Job.id.desc()).limit(remaining_needed)
+        if processing_ids:
+            query = query.filter(Job.id.notin_(processing_ids))
+        recent_other_jobs = query.all()
+
+    recent_jobs = processing_jobs + recent_other_jobs
 
     # Get active workers count efficiently (uses index: ix_worker_status)
     active_worker_count = (
@@ -469,28 +485,24 @@ async def get_chart_data(
         avg_times.append(round(processing_time, 2))
         avg_time_labels.append(f"#{job_id}")
 
-    # Overall average processing time: Calculate from recent 10k jobs for speed
-    # Uses primary key index for fast retrieval
-    recent_jobs_for_avg = (
-        db.query(Job.assigned_at, Job.completed_at)
+    # Overall average processing time: Use database calculation for last 24h
+    # Much faster than fetching 10k rows - uses ix_status_completed index
+    # Calculate average in database using SQLite's julianday for date math
+    avg_time_query = (
+        db.query(
+            func.avg(
+                (func.julianday(Job.completed_at) - func.julianday(Job.assigned_at)) * 24 * 60
+            ).label('avg_minutes')
+        )
         .filter(
             Job.status == JobStatus.COMPLETED,
             Job.assigned_at.isnot(None),
             Job.completed_at.isnot(None),
+            Job.completed_at >= last_24h  # Only recent jobs
         )
-        .order_by(Job.id.desc())
-        .limit(10000)
-        .all()
-    )
+    ).scalar()
 
-    # Calculate average in Python (small dataset)
-    total_avg_time = 0
-    if recent_jobs_for_avg:
-        total_seconds = sum(
-            (completed - assigned).total_seconds()
-            for assigned, completed in recent_jobs_for_avg
-        )
-        total_avg_time = round((total_seconds / len(recent_jobs_for_avg)) / 60, 2)
+    total_avg_time = round(float(avg_time_query), 2) if avg_time_query else 0
 
     # Status distribution: Use single query with grouping
     status_counts_query = (

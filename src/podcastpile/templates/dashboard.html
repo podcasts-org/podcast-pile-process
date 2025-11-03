@@ -359,11 +359,29 @@
             loadChartData();
         }
 
-        // Auto-refresh every 5 seconds
+        // Auto-refresh chart data every 10 seconds (without full page reload)
         setInterval(() => {
             loadChartData();
-            setTimeout(() => location.reload(), 5000);
+            updateStats();
         }, 10000);
+
+        // Update stats without page reload
+        async function updateStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const stats = await response.json();
+
+                // Update stat cards
+                document.querySelector('.stat-card:nth-child(1) .value').textContent = stats.total_jobs.toLocaleString();
+                document.querySelector('.stat-card:nth-child(2) .value').textContent = stats.pending.toLocaleString();
+                document.querySelector('.stat-card:nth-child(3) .value').textContent = (stats.assigned + stats.processing).toLocaleString();
+                document.querySelector('.stat-card:nth-child(4) .value').textContent = stats.completed.toLocaleString();
+                document.querySelector('.stat-card:nth-child(5) .value').textContent = stats.failed.toLocaleString();
+                document.querySelector('.stat-card:nth-child(6) .value').textContent = stats.expired.toLocaleString();
+            } catch (error) {
+                console.error('Error updating stats:', error);
+            }
+        }
 
         // Initialize charts when page loads
         window.addEventListener('load', initCharts);
