@@ -20,13 +20,15 @@ import nemo.collections.asr as nemo_asr
 import numpy as np
 import requests
 import soundfile as sf
+import torch
 from nemo.collections.asr.models import SortformerEncLabelModel
+from torchmetrics.functional.audio.nisqa import non_intrusive_speech_quality_assessment as tm_nisqa
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.1.2"
+WORKER_VERSION = "0.1.3"  # Added NISQA quality assessment
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -436,6 +438,77 @@ class AudioProcessor:
                         results[i]["bgm_probability"] = 0.0
                         results[i]["bgm"] = False
 
+            # NISQA quality assessment for all segments (BATCHED for GPU efficiency)
+            logger.info(f"Assessing audio quality (NISQA) for {len(temp_files)} segments...")
+
+            try:
+                # Prepare audio tensors for batched NISQA
+                # NISQA expects 16kHz audio
+                nisqa_tensors = []
+                nisqa_indices = []
+                device = torch.device(f"cuda:{self.gpu_id}" if self.gpu_id is not None and torch.cuda.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+
+                for i, audio_input in enumerate(audio_inputs):
+                    if audio_input is not None:
+                        audio_array = audio_input["array"]
+                        # NISQA expects tensors on GPU
+                        audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
+                        nisqa_tensors.append(audio_tensor)
+                        nisqa_indices.append(i)
+                    else:
+                        # Set defaults for failed segments
+                        results[i]["quality_mos"] = None
+                        results[i]["quality_noisiness"] = None
+                        results[i]["quality_discontinuity"] = None
+                        results[i]["quality_coloration"] = None
+                        results[i]["quality_loudness"] = None
+
+                # Process in batches to avoid OOM
+                nisqa_batch_size = 32
+                for batch_start in range(0, len(nisqa_tensors), nisqa_batch_size):
+                    batch_end = min(batch_start + nisqa_batch_size, len(nisqa_tensors))
+                    batch_tensors = nisqa_tensors[batch_start:batch_end]
+                    batch_indices = nisqa_indices[batch_start:batch_end]
+
+                    # Stack tensors - pad to same length if needed
+                    max_len = max(t.shape[0] for t in batch_tensors)
+                    padded_tensors = []
+                    for t in batch_tensors:
+                        if t.shape[0] < max_len:
+                            # Pad with zeros
+                            padding = torch.zeros(max_len - t.shape[0], device=device, dtype=torch.float32)
+                            t = torch.cat([t, padding])
+                        padded_tensors.append(t)
+
+                    batch_tensor = torch.stack(padded_tensors)
+
+                    # Run NISQA on batch
+                    with torch.no_grad():
+                        # NISQA returns: (mos, noisiness, discontinuity, coloration, loudness)
+                        mos, noisiness, discontinuity, coloration, loudness = tm_nisqa(batch_tensor, 16000)
+
+                    # Map results back to segments
+                    for i, idx in enumerate(batch_indices):
+                        results[idx]["quality_mos"] = float(mos[i].cpu().item())
+                        results[idx]["quality_noisiness"] = float(noisiness[i].cpu().item())
+                        results[idx]["quality_discontinuity"] = float(discontinuity[i].cpu().item())
+                        results[idx]["quality_coloration"] = float(coloration[i].cpu().item())
+                        results[idx]["quality_loudness"] = float(loudness[i].cpu().item())
+
+                logger.info(f"✓ Assessed quality for {len(nisqa_tensors)} segments")
+
+            except Exception as e:
+                logger.warning(f"Batch NISQA assessment failed: {e}, setting defaults")
+                import traceback
+                traceback.print_exc()
+                for i in range(len(results)):
+                    if "quality_mos" not in results[i]:
+                        results[i]["quality_mos"] = None
+                        results[i]["quality_noisiness"] = None
+                        results[i]["quality_discontinuity"] = None
+                        results[i]["quality_coloration"] = None
+                        results[i]["quality_loudness"] = None
+
         finally:
             # Clean up temporary files
             for temp_file in temp_files:
@@ -447,6 +520,32 @@ class AudioProcessor:
 
         # Get GPU info
         gpu_info = get_gpu_info(self.gpu_id)
+
+        # Compute episode-level quality statistics from segment scores
+        quality_mos_scores = [s.get("quality_mos") for s in results if s.get("quality_mos") is not None]
+        quality_noisiness_scores = [s.get("quality_noisiness") for s in results if s.get("quality_noisiness") is not None]
+        quality_discontinuity_scores = [s.get("quality_discontinuity") for s in results if s.get("quality_discontinuity") is not None]
+        quality_coloration_scores = [s.get("quality_coloration") for s in results if s.get("quality_coloration") is not None]
+        quality_loudness_scores = [s.get("quality_loudness") for s in results if s.get("quality_loudness") is not None]
+
+        episode_quality = {}
+        if quality_mos_scores:
+            episode_quality = {
+                "mean_mos": float(np.mean(quality_mos_scores)),
+                "median_mos": float(np.median(quality_mos_scores)),
+                "p25_mos": float(np.percentile(quality_mos_scores, 25)),
+                "p75_mos": float(np.percentile(quality_mos_scores, 75)),
+                "min_mos": float(np.min(quality_mos_scores)),
+                "max_mos": float(np.max(quality_mos_scores)),
+                "mean_noisiness": float(np.mean(quality_noisiness_scores)),
+                "mean_discontinuity": float(np.mean(quality_discontinuity_scores)),
+                "mean_coloration": float(np.mean(quality_coloration_scores)),
+                "mean_loudness": float(np.mean(quality_loudness_scores)),
+                # Quality tier counts
+                "high_quality_segments": sum(1 for s in quality_mos_scores if s >= 4.0),
+                "medium_quality_segments": sum(1 for s in quality_mos_scores if 3.0 <= s < 4.0),
+                "low_quality_segments": sum(1 for s in quality_mos_scores if s < 3.0),
+            }
 
         # Create output record with all metadata
         output_record = {
@@ -462,11 +561,14 @@ class AudioProcessor:
             "gpu_info": gpu_info,
             "bgm_model": self.bgm_model_id,
             "worker_version": WORKER_VERSION,
+            "episode_quality": episode_quality,
             "processed_at": datetime.utcnow().isoformat() + "Z",
         }
 
         logger.info(f"✓ Processed {len(results)} segments in {processing_time:.2f}s")
         logger.info(f"  Speakers detected: {output_record['num_speakers']}")
+        if episode_quality:
+            logger.info(f"  Quality: MOS={episode_quality['mean_mos']:.2f} (median={episode_quality['median_mos']:.2f})")
         if gpu_info:
             logger.info(f"  GPU: {gpu_info}")
 
