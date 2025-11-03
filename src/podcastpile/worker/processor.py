@@ -484,25 +484,46 @@ class AudioProcessor:
                         results[i]["quality_loudness"] = None
 
                 # Process segments individually (NISQA doesn't support batching)
+                successful_assessments = 0
                 for idx, audio_tensor in zip(nisqa_indices, nisqa_tensors):
-                    # Run NISQA on single audio segment
-                    with torch.no_grad():
-                        # NISQA returns a tensor with 5 values
-                        nisqa_result = tm_nisqa(audio_tensor, 16000)
-                        # Convert to list: [mos, noisiness, discontinuity, coloration, loudness]
-                        scores = nisqa_result.detach().cpu().numpy().tolist()
+                    try:
+                        # Run NISQA on single audio segment
+                        with torch.no_grad():
+                            # NISQA returns a tensor with 5 values
+                            nisqa_result = tm_nisqa(audio_tensor, 16000)
+                            # Convert to list: [mos, noisiness, discontinuity, coloration, loudness]
+                            scores = nisqa_result.detach().cpu().numpy().tolist()
 
-                        # Unpack the 5 scores
-                        mos, noisiness, discontinuity, coloration, loudness = scores
+                            # Unpack the 5 scores
+                            mos, noisiness, discontinuity, coloration, loudness = scores
 
-                    # Store results
-                    results[idx]["quality_mos"] = float(mos)
-                    results[idx]["quality_noisiness"] = float(noisiness)
-                    results[idx]["quality_discontinuity"] = float(discontinuity)
-                    results[idx]["quality_coloration"] = float(coloration)
-                    results[idx]["quality_loudness"] = float(loudness)
+                        # Store results
+                        results[idx]["quality_mos"] = float(mos)
+                        results[idx]["quality_noisiness"] = float(noisiness)
+                        results[idx]["quality_discontinuity"] = float(discontinuity)
+                        results[idx]["quality_coloration"] = float(coloration)
+                        results[idx]["quality_loudness"] = float(loudness)
+                        successful_assessments += 1
+                    except RuntimeError as e:
+                        # Handle segments that are too short for NISQA
+                        if "too short" in str(e):
+                            logger.debug(f"Segment {idx} too short for NISQA, skipping")
+                            results[idx]["quality_mos"] = None
+                            results[idx]["quality_noisiness"] = None
+                            results[idx]["quality_discontinuity"] = None
+                            results[idx]["quality_coloration"] = None
+                            results[idx]["quality_loudness"] = None
+                        else:
+                            raise
+                    except Exception as e:
+                        logger.warning(f"NISQA assessment failed for segment {idx}: {e}")
+                        results[idx]["quality_mos"] = None
+                        results[idx]["quality_noisiness"] = None
+                        results[idx]["quality_discontinuity"] = None
+                        results[idx]["quality_coloration"] = None
+                        results[idx]["quality_loudness"] = None
 
-                logger.info(f"✓ Assessed quality for {len(nisqa_tensors)} segments")
+                logger.info(f"✓ Assessed quality for {successful_assessments}/{len(nisqa_tensors)} segments")
 
             except Exception as e:
                 logger.warning(f"Batch NISQA assessment failed: {e}, setting defaults")
