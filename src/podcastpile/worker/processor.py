@@ -28,7 +28,7 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.1.3"  # Added NISQA quality assessment
+WORKER_VERSION = "0.1.4"  # Added clipping detection and loudness metrics
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -331,6 +331,26 @@ class AudioProcessor:
             segment_audio = self.extract_audio_segment(
                 audio, sr, segment["start"], segment["end"]
             )
+
+            # Compute clipping and loudness metrics for this segment
+            # Clipping detection: count samples at or near maximum amplitude
+            clipped_samples = np.sum(np.abs(segment_audio) >= 0.99)
+            clip_rate = float(clipped_samples / len(segment_audio)) if len(segment_audio) > 0 else 0.0
+
+            # Loudness metrics
+            rms = np.sqrt(np.mean(segment_audio**2))
+            rms_db = 20 * np.log10(rms) if rms > 0 else -100.0
+            peak = np.max(np.abs(segment_audio))
+            peak_db = 20 * np.log10(peak) if peak > 0 else -100.0
+
+            # Add to segment metadata
+            segment["clip_rate"] = clip_rate
+            segment["clipped_samples"] = int(clipped_samples)
+            segment["has_clipping"] = clip_rate > 0.001  # >0.1% clipping threshold
+            segment["rms_db"] = float(rms_db)
+            segment["peak_db"] = float(peak_db)
+            segment["dynamic_range_db"] = float(peak_db - rms_db)
+
             temp_path = f"/tmp/segment_{session_id}_{i}.wav"
             sf.write(temp_path, segment_audio, 16000)
             temp_files.append(temp_path)
@@ -528,9 +548,16 @@ class AudioProcessor:
         quality_coloration_scores = [s.get("quality_coloration") for s in results if s.get("quality_coloration") is not None]
         quality_loudness_scores = [s.get("quality_loudness") for s in results if s.get("quality_loudness") is not None]
 
+        # Clipping and loudness aggregations
+        clip_rates = [s.get("clip_rate", 0.0) for s in results]
+        rms_db_values = [s.get("rms_db") for s in results if s.get("rms_db") is not None]
+        peak_db_values = [s.get("peak_db") for s in results if s.get("peak_db") is not None]
+        dynamic_range_values = [s.get("dynamic_range_db") for s in results if s.get("dynamic_range_db") is not None]
+
         episode_quality = {}
         if quality_mos_scores:
             episode_quality = {
+                # NISQA scores
                 "mean_mos": float(np.mean(quality_mos_scores)),
                 "median_mos": float(np.median(quality_mos_scores)),
                 "p25_mos": float(np.percentile(quality_mos_scores, 25)),
@@ -545,6 +572,28 @@ class AudioProcessor:
                 "high_quality_segments": sum(1 for s in quality_mos_scores if s >= 4.0),
                 "medium_quality_segments": sum(1 for s in quality_mos_scores if 3.0 <= s < 4.0),
                 "low_quality_segments": sum(1 for s in quality_mos_scores if s < 3.0),
+            }
+
+        # Clipping statistics
+        clipping_stats = {
+            "mean_clip_rate": float(np.mean(clip_rates)),
+            "max_clip_rate": float(np.max(clip_rates)),
+            "segments_with_clipping": sum(1 for s in results if s.get("has_clipping", False)),
+            "total_clipped_samples": sum(s.get("clipped_samples", 0) for s in results),
+        }
+
+        # Loudness statistics
+        loudness_stats = {}
+        if rms_db_values:
+            loudness_stats = {
+                "mean_rms_db": float(np.mean(rms_db_values)),
+                "median_rms_db": float(np.median(rms_db_values)),
+                "min_rms_db": float(np.min(rms_db_values)),
+                "max_rms_db": float(np.max(rms_db_values)),
+                "mean_peak_db": float(np.mean(peak_db_values)),
+                "max_peak_db": float(np.max(peak_db_values)),
+                "mean_dynamic_range_db": float(np.mean(dynamic_range_values)),
+                "rms_variation": float(np.std(rms_db_values)),  # Loudness consistency
             }
 
         # Create output record with all metadata
@@ -562,6 +611,8 @@ class AudioProcessor:
             "bgm_model": self.bgm_model_id,
             "worker_version": WORKER_VERSION,
             "episode_quality": episode_quality,
+            "clipping_stats": clipping_stats,
+            "loudness_stats": loudness_stats,
             "processed_at": datetime.utcnow().isoformat() + "Z",
         }
 
@@ -569,6 +620,10 @@ class AudioProcessor:
         logger.info(f"  Speakers detected: {output_record['num_speakers']}")
         if episode_quality:
             logger.info(f"  Quality: MOS={episode_quality['mean_mos']:.2f} (median={episode_quality['median_mos']:.2f})")
+        if clipping_stats["segments_with_clipping"] > 0:
+            logger.info(f"  Clipping: {clipping_stats['segments_with_clipping']}/{len(results)} segments, max rate={clipping_stats['max_clip_rate']:.4f}")
+        if loudness_stats:
+            logger.info(f"  Loudness: mean={loudness_stats['mean_rms_db']:.1f}dB, peak={loudness_stats['max_peak_db']:.1f}dB")
         if gpu_info:
             logger.info(f"  GPU: {gpu_info}")
 
