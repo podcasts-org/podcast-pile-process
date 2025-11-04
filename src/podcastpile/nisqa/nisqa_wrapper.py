@@ -221,12 +221,19 @@ class NISQAPredictor:
             audio_arrays = resampled_arrays
             sample_rate = target_sr
 
-        # Write arrays to temporary WAV files (trim to max length if needed)
+        # Write arrays to temporary WAV files (handle length constraints)
         temp_files = []
+        valid_indices = []
         temp_dir = tempfile.mkdtemp()
 
-        # Calculate max audio length based on NISQA's max_segments
-        # max_segments is in spectrogram frames, need to convert to audio samples
+        # Calculate min and max audio length based on NISQA's requirements
+        # seg_length is in spectrogram windows, not seconds
+        seg_length = self.args.get('ms_seg_length', 15)  # in windows/frames
+        hop_length_sec = self.args.get('ms_hop_length', 0.01)  # in seconds
+        # Minimum duration = seg_length * hop_length (e.g., 15 * 0.01 = 0.15 seconds)
+        min_duration_sec = seg_length * hop_length_sec
+        min_samples = int(min_duration_sec * sample_rate)
+
         max_segments = self.args.get('ms_max_segments', 1300)
         hop_length_sec = self.args.get('ms_hop_length', 0.01)  # in seconds
         max_duration_sec = max_segments * hop_length_sec  # max duration in seconds
@@ -234,6 +241,11 @@ class NISQAPredictor:
 
         try:
             for i, audio in enumerate(audio_arrays):
+                # Skip audio that's too short (NISQA requires min seg_length)
+                if len(audio) < min_samples:
+                    # Will set to None later
+                    continue
+
                 # Trim audio if too long
                 if len(audio) > max_samples:
                     audio = audio[:max_samples]
@@ -241,23 +253,42 @@ class NISQAPredictor:
                 temp_path = os.path.join(temp_dir, f"temp_{i}.wav")
                 sf.write(temp_path, audio, sample_rate)
                 temp_files.append(temp_path)
+                valid_indices.append(i)
 
-            # Use the file-based prediction method
-            df = self.predict_files(temp_files, batch_size=batch_size, num_workers=0)
+            # Use the file-based prediction method if we have valid files
+            if temp_files:
+                df = self.predict_files(temp_files, batch_size=batch_size, num_workers=0)
+            else:
+                df = None
 
-            # Extract predictions
+            # Create output arrays with None for all segments initially
+            num_arrays = len(audio_arrays)
             if self.dim:
-                return {
-                    'mos': df['mos_pred'].values,
-                    'noisiness': df['noi_pred'].values,
-                    'discontinuity': df['dis_pred'].values,
-                    'coloration': df['col_pred'].values,
-                    'loudness': df['loud_pred'].values,
+                result = {
+                    'mos': np.array([None] * num_arrays, dtype=object),
+                    'noisiness': np.array([None] * num_arrays, dtype=object),
+                    'discontinuity': np.array([None] * num_arrays, dtype=object),
+                    'coloration': np.array([None] * num_arrays, dtype=object),
+                    'loudness': np.array([None] * num_arrays, dtype=object),
                 }
             else:
-                return {
-                    'mos': df['mos_pred'].values
+                result = {
+                    'mos': np.array([None] * num_arrays, dtype=object)
                 }
+
+            # Fill in predictions for valid segments
+            if df is not None:
+                for i, orig_idx in enumerate(valid_indices):
+                    if self.dim:
+                        result['mos'][orig_idx] = float(df['mos_pred'].iloc[i])
+                        result['noisiness'][orig_idx] = float(df['noi_pred'].iloc[i])
+                        result['discontinuity'][orig_idx] = float(df['dis_pred'].iloc[i])
+                        result['coloration'][orig_idx] = float(df['col_pred'].iloc[i])
+                        result['loudness'][orig_idx] = float(df['loud_pred'].iloc[i])
+                    else:
+                        result['mos'][orig_idx] = float(df['mos_pred'].iloc[i])
+
+            return result
         finally:
             # Clean up temp files
             import shutil
