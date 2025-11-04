@@ -458,35 +458,30 @@ class AudioProcessor:
                         results[i]["bgm_probability"] = 0.0
                         results[i]["bgm"] = False
 
-            # NISQA quality assessment for all segments (BATCHED for GPU efficiency)
+            # NISQA quality assessment for all segments (GPU-optimized with proper cleanup)
             logger.info(f"Assessing audio quality (NISQA) for {len(temp_files)} segments...")
 
             try:
-                # Prepare audio tensors for batched NISQA
-                # NISQA expects 16kHz audio
-                nisqa_tensors = []
-                nisqa_indices = []
                 device = torch.device(f"cuda:{self.gpu_id}" if self.gpu_id is not None and torch.cuda.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 
+                # Process segments individually with proper GPU memory management
+                successful_assessments = 0
                 for i, audio_input in enumerate(audio_inputs):
-                    if audio_input is not None:
-                        audio_array = audio_input["array"]
-                        # NISQA expects tensors on GPU
-                        audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
-                        nisqa_tensors.append(audio_tensor)
-                        nisqa_indices.append(i)
-                    else:
+                    if audio_input is None:
                         # Set defaults for failed segments
                         results[i]["quality_mos"] = None
                         results[i]["quality_noisiness"] = None
                         results[i]["quality_discontinuity"] = None
                         results[i]["quality_coloration"] = None
                         results[i]["quality_loudness"] = None
+                        continue
 
-                # Process segments individually (NISQA doesn't support batching)
-                successful_assessments = 0
-                for idx, audio_tensor in zip(nisqa_indices, nisqa_tensors):
                     try:
+                        audio_array = audio_input["array"]
+
+                        # Create tensor on GPU just-in-time
+                        audio_tensor = torch.tensor(audio_array, dtype=torch.float32, device=device)
+
                         # Run NISQA on single audio segment
                         with torch.no_grad():
                             # NISQA returns a tensor with 5 values
@@ -498,32 +493,48 @@ class AudioProcessor:
                             mos, noisiness, discontinuity, coloration, loudness = scores
 
                         # Store results
-                        results[idx]["quality_mos"] = float(mos)
-                        results[idx]["quality_noisiness"] = float(noisiness)
-                        results[idx]["quality_discontinuity"] = float(discontinuity)
-                        results[idx]["quality_coloration"] = float(coloration)
-                        results[idx]["quality_loudness"] = float(loudness)
+                        results[i]["quality_mos"] = float(mos)
+                        results[i]["quality_noisiness"] = float(noisiness)
+                        results[i]["quality_discontinuity"] = float(discontinuity)
+                        results[i]["quality_coloration"] = float(coloration)
+                        results[i]["quality_loudness"] = float(loudness)
                         successful_assessments += 1
+
+                        # Explicitly clean up GPU memory after each segment
+                        del audio_tensor, nisqa_result
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+
                     except RuntimeError as e:
                         # Handle segments that are too short for NISQA
                         if "too short" in str(e):
-                            logger.debug(f"Segment {idx} too short for NISQA, skipping")
-                            results[idx]["quality_mos"] = None
-                            results[idx]["quality_noisiness"] = None
-                            results[idx]["quality_discontinuity"] = None
-                            results[idx]["quality_coloration"] = None
-                            results[idx]["quality_loudness"] = None
+                            logger.debug(f"Segment {i} too short for NISQA, skipping")
+                            results[i]["quality_mos"] = None
+                            results[i]["quality_noisiness"] = None
+                            results[i]["quality_discontinuity"] = None
+                            results[i]["quality_coloration"] = None
+                            results[i]["quality_loudness"] = None
                         else:
-                            raise
+                            # Log CUDA errors but don't crash the whole job
+                            logger.error(f"NISQA RuntimeError for segment {i}: {e}")
+                            results[i]["quality_mos"] = None
+                            results[i]["quality_noisiness"] = None
+                            results[i]["quality_discontinuity"] = None
+                            results[i]["quality_coloration"] = None
+                            results[i]["quality_loudness"] = None
+                            # Try to recover CUDA state
+                            if device.type == 'cuda':
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
                     except Exception as e:
-                        logger.warning(f"NISQA assessment failed for segment {idx}: {e}")
-                        results[idx]["quality_mos"] = None
-                        results[idx]["quality_noisiness"] = None
-                        results[idx]["quality_discontinuity"] = None
-                        results[idx]["quality_coloration"] = None
-                        results[idx]["quality_loudness"] = None
+                        logger.warning(f"NISQA assessment failed for segment {i}: {e}")
+                        results[i]["quality_mos"] = None
+                        results[i]["quality_noisiness"] = None
+                        results[i]["quality_discontinuity"] = None
+                        results[i]["quality_coloration"] = None
+                        results[i]["quality_loudness"] = None
 
-                logger.info(f"✓ Assessed quality for {successful_assessments}/{len(nisqa_tensors)} segments")
+                logger.info(f"✓ Assessed quality for {successful_assessments}/{len(audio_inputs)} segments")
 
             except Exception as e:
                 logger.warning(f"Batch NISQA assessment failed: {e}, setting defaults")
