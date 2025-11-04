@@ -14,6 +14,13 @@ def cli():
 
 
 @cli.command()
+def version():
+    """Print worker processor version."""
+    from podcastpile.worker.processor import WORKER_VERSION
+    click.echo(f"Worker Version: {WORKER_VERSION}")
+
+
+@cli.command()
 @click.option("-p", "--port", default=8000, help="Port to run on")
 @click.option("--host", default="0.0.0.0", help="Host to bind to")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
