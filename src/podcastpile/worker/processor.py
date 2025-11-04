@@ -28,7 +28,7 @@ from podcastpile.nisqa import NISQAPredictor
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.1.5"  # Added clipping detection and loudness metrics
+WORKER_VERSION = "0.1.6"  # Added clipping detection and loudness metrics
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
