@@ -24,19 +24,16 @@ Examples:
 
 import argparse
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from podcastpile.models.job import Job, JobStatus
+from podcastpile.models import Job, JobStatus, SessionLocal
 
 
 def reset_failed_jobs(
-    database_url: str,
     dry_run: bool = False,
     error_contains: str = None,
     hours: int = None,
@@ -46,16 +43,13 @@ def reset_failed_jobs(
     Reset failed jobs to pending status.
 
     Args:
-        database_url: Database connection URL
         dry_run: If True, only show what would be reset without making changes
         error_contains: Only reset jobs whose error message contains this text
         hours: Only reset jobs that failed in the last N hours
         limit: Maximum number of jobs to reset
     """
-    # Create database connection
-    engine = create_engine(database_url)
-    Session = sessionmaker(bind=engine)
-    session = Session()
+    # Use the existing database session
+    session = SessionLocal()
 
     try:
         # Build query for failed jobs
@@ -66,7 +60,7 @@ def reset_failed_jobs(
             query = query.filter(Job.error_message.contains(error_contains))
 
         if hours:
-            cutoff_time = datetime.utcnow() - timedelta(hours=hours)
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
             query = query.filter(Job.completed_at >= cutoff_time)
 
         # Order by ID and apply limit
@@ -157,11 +151,6 @@ Examples:
     )
 
     parser.add_argument(
-        '--database-url',
-        default='sqlite:///jobs.db',
-        help='Database URL (default: sqlite:///jobs.db)'
-    )
-    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='Preview changes without actually resetting jobs'
@@ -185,7 +174,6 @@ Examples:
 
     # Run the reset
     result = reset_failed_jobs(
-        database_url=args.database_url,
         dry_run=args.dry_run,
         error_contains=args.error_contains,
         hours=args.hours,
