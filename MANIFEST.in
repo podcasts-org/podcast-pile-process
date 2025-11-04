@@ -3,6 +3,7 @@ include requirements.txt
 include .env.example
 recursive-include src/podcastpile/templates *.html
 recursive-include src/podcastpile *.py
+recursive-include src/podcastpile/nisqa/weights *.tar
 global-exclude *.pyc
 global-exclude __pycache__
 global-exclude *.egg-info/*

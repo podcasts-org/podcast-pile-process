@@ -12,6 +12,9 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     include_package_data=True,
+    package_data={
+        "podcastpile.nisqa": ["weights/*.tar"],
+    },
     long_description=long_description,
     long_description_content_type="text/markdown",
     install_requires=[
