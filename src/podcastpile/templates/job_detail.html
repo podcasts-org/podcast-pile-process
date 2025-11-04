@@ -240,7 +240,12 @@
         {% if job.result_json %}
         <div class="card">
             <h2>Result Data (JSON)</h2>
-            <div class="text-result">{{ job.result_json|tojson(indent=2) }}</div>
+            <andypf-json-viewer
+              id="result-viewer"
+              theme="monokai"
+              expanded="2"
+              show-toolbar="true"
+            ></andypf-json-viewer>
         </div>
         {% endif %}
 
@@ -265,7 +270,20 @@
         {% endif %}
     </div>
 
+    <!-- JSON Viewer library -->
+    <script src="https://unpkg.com/@andypf/json-viewer@2.2.0/dist/cjs/index.js"></script>
+
     <script>
+        // Initialize JSON viewer with result data
+        {% if job.result_json %}
+        document.addEventListener('DOMContentLoaded', function() {
+            const viewer = document.getElementById('result-viewer');
+            if (viewer) {
+                viewer.data = {{ job.result_json|tojson|safe }};
+            }
+        });
+        {% endif %}
+
         async function retryJob() {
             const button = document.getElementById('retry-button');
             const message = document.getElementById('retry-message');
