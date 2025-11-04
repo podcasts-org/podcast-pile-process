@@ -616,7 +616,7 @@ class AudioProcessor:
             "episode_quality": episode_quality,
             "clipping_stats": clipping_stats,
             "loudness_stats": loudness_stats,
-            "processed_at": datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z'),
+            "processed_at": datetime.datetime.utcnow().isoformat() + 'Z',
         }
 
         logger.info(f"✓ Processed {len(results)} segments in {processing_time:.2f}s")
