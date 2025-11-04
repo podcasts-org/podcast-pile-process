@@ -32,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from podcastpile.manager.models import Job, JobStatus
+from podcastpile.models.job import Job, JobStatus
 
 
 def reset_failed_jobs(
