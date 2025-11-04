@@ -176,14 +176,16 @@ def worker(
         processes = []
         base_worker_id = worker_id or socket.gethostname()
 
+        # Flag to track shutdown request (set by signal handler)
+        shutdown_requested = False
+
         def signal_handler(sig, frame):
-            click.echo("\n\nShutting down all workers...")
-            for p in processes:
-                p.terminate()
-            for p in processes:
-                p.join(timeout=5)
-            click.echo("All workers stopped")
-            sys.exit(0)
+            # IMPORTANT: Signal handlers must be minimal to avoid:
+            # 1. Reentrant I/O errors (no print/click.echo/logging)
+            # 2. "can only join child process" errors (no process.join())
+            # Just set a flag and let the main loop handle cleanup
+            nonlocal shutdown_requested
+            shutdown_requested = True
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -219,9 +221,44 @@ def worker(
             f"\nAll {len(gpu_list)} workers running. Press Ctrl+C to stop all workers."
         )
 
-        # Wait for all processes
-        for p in processes:
-            p.join()
+        # Wait for processes or shutdown signal
+        try:
+            while not shutdown_requested:
+                # Check if any process has died
+                alive = [p for p in processes if p.is_alive()]
+                if len(alive) < len(processes):
+                    click.echo(f"\nWarning: {len(processes) - len(alive)} worker(s) died unexpectedly")
+                    break
+
+                # Sleep briefly to avoid busy waiting
+                import time
+                time.sleep(1)
+        except KeyboardInterrupt:
+            # Shouldn't happen (signal handler should catch it), but just in case
+            shutdown_requested = True
+
+        # Graceful shutdown: terminate workers and wait briefly
+        if shutdown_requested:
+            click.echo("\n\nShutdown requested. Terminating workers...")
+            click.echo("Note: Jobs in progress will remain in 'processing' state for manager cleanup")
+
+            # Send terminate signal to all workers
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+
+            # Wait a bit for graceful termination
+            click.echo("Waiting for workers to stop...")
+            for p in processes:
+                p.join(timeout=10)
+                if p.is_alive():
+                    click.echo(f"Warning: Worker {p.pid} did not stop gracefully, killing...")
+                    p.kill()
+
+            click.echo("All workers stopped")
+        else:
+            # Workers died unexpectedly, just inform the user
+            click.echo("One or more workers stopped unexpectedly. Check logs for details.")
 
     else:
         # Single worker mode
