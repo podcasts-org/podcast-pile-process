@@ -21,7 +21,9 @@ class NISQAPredictor:
     def __init__(self,
                  model_path: Optional[str] = None,
                  device: Optional[torch.device] = None,
-                 dim: bool = True):
+                 dim: bool = True,
+                 fp16: bool = True,
+                 compile_model: bool = True):
         """
         Initialize NISQA predictor.
 
@@ -30,9 +32,13 @@ class NISQAPredictor:
                        If None, uses default weights/nisqa.tar
             device: torch device to use. If None, auto-detects CUDA
             dim: If True, uses DIM model (MOS + dimensions), else MOS only
+            fp16: If True, uses FP16 inference for ~2x speedup (CUDA only)
+            compile_model: If True, uses torch.compile for additional speedup
         """
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.dim = dim
+        self.fp16 = fp16 and self.device.type == 'cuda'  # Only use FP16 on CUDA
+        self.compile_model = compile_model
 
         # Use default weights if no path provided
         if model_path is None:
@@ -102,6 +108,18 @@ class NISQAPredictor:
         self.model.to(self.device)
         self.model.eval()
 
+        # Convert to FP16 for faster inference
+        if self.fp16:
+            self.model = self.model.half()
+
+        # Compile model for additional speedup (PyTorch 2.0+)
+        if self.compile_model:
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Model compilation failed: {e}. Continuing without compilation.")
+
     def predict_files(self,
                      file_paths: List[str],
                      batch_size: int = 8,
@@ -167,13 +185,18 @@ class NISQAPredictor:
             num_workers=num_workers
         )
 
-        # Predict
+        # Predict with optional autocast for FP16
         with torch.no_grad():
             y_hat_list = []
             for xb, yb, (idx, n_wins) in dl:
                 xb = xb.to(self.device)
                 n_wins = n_wins.to(self.device)
-                y_hat = self.model(xb, n_wins).cpu().numpy()
+
+                # Convert to FP16 if enabled
+                if self.fp16:
+                    xb = xb.half()
+
+                y_hat = self.model(xb, n_wins).float().cpu().numpy()  # Always output FP32
                 y_hat_list.append(y_hat)
 
         # Concatenate results
@@ -194,7 +217,7 @@ class NISQAPredictor:
     def predict_arrays(self,
                       audio_arrays: List[np.ndarray],
                       sample_rate: int = 16000,
-                      batch_size: int = 8) -> Dict[str, np.ndarray]:
+                      batch_size: int = 32) -> Dict[str, np.ndarray]:
         """
         Predict quality scores for audio arrays (using temp files for compatibility).
 

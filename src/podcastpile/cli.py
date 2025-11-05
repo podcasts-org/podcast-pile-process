@@ -21,6 +21,223 @@ def version():
 
 
 @cli.command()
+@click.argument("audio_url")
+@click.option(
+    "-l",
+    "--language",
+    default="en",
+    help="Language code (default: en)",
+)
+@click.option(
+    "-c",
+    "--config",
+    type=click.Choice(
+        ["very_high_latency", "high_latency", "low_latency", "ultra_low_latency"]
+    ),
+    default="high_latency",
+    help="Diarization configuration (default: high_latency)",
+)
+@click.option("--model", help="Path to custom .nemo model file")
+@click.option(
+    "--batch-size",
+    default=4,
+    type=int,
+    help="Batch size for ASR transcription (default: 4)",
+)
+@click.option("--gpu", type=int, help="GPU device ID to use (e.g., 0, 1, 2)")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
+def test_worker(audio_url, language, config, model, batch_size, gpu, verbose):
+    """Test the worker processor on a single audio file without writing results.
+
+    This command downloads and processes an audio file to benchmark performance
+    and verify the processing pipeline. No results are saved to the manager.
+
+    Example:
+        ppcli test-worker https://example.com/test.mp3
+        ppcli test-worker https://example.com/test.mp3 --gpu 0 --verbose
+    """
+    import logging
+    import tempfile
+    import time
+    import json
+    from pathlib import Path
+
+    # Setup logging
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    logger = logging.getLogger(__name__)
+
+    click.echo("=" * 60)
+    click.echo("🧪 WORKER PROCESSOR TEST MODE")
+    click.echo("=" * 60)
+
+    # Import worker dependencies
+    try:
+        from podcastpile.worker.processor import AudioProcessor, WORKER_VERSION
+        import requests
+    except ImportError as e:
+        click.echo(f"❌ Error: Failed to import dependencies: {e}", err=True)
+        click.echo("\nInstall required dependencies:", err=True)
+        click.echo("  pip install nemo_toolkit[asr] librosa soundfile torchaudio", err=True)
+        raise click.Abort()
+
+    click.echo(f"\n📋 Configuration:")
+    click.echo(f"  Worker Version:  {WORKER_VERSION}")
+    click.echo(f"  Audio URL:       {audio_url}")
+    click.echo(f"  Language:        {language}")
+    click.echo(f"  Diar Config:     {config}")
+    click.echo(f"  Batch Size:      {batch_size}")
+    click.echo(f"  GPU:             {gpu if gpu is not None else 'auto'}")
+    click.echo()
+
+    # Create processor
+    click.echo("⏳ Initializing processor...")
+    try:
+        processor = AudioProcessor(
+            config=config,
+            model_path=model,
+            gpu_id=gpu,
+            languages=language,
+            batch_size=batch_size,
+        )
+    except Exception as e:
+        click.echo(f"❌ Failed to create processor: {e}", err=True)
+        raise click.Abort()
+
+    # Load models
+    click.echo("⏳ Loading models (this may take a while)...")
+    load_start = time.time()
+    try:
+        processor.load_models()
+        load_time = time.time() - load_start
+        click.echo(f"✅ Models loaded in {load_time:.1f}s\n")
+    except Exception as e:
+        click.echo(f"❌ Failed to load models: {e}", err=True)
+        raise click.Abort()
+
+    # Download audio
+    click.echo(f"⏳ Downloading audio from {audio_url}...")
+    download_start = time.time()
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Download file
+            response = requests.get(audio_url, stream=True)
+            response.raise_for_status()
+
+            # Determine file extension
+            ext = ".mp3"
+            if audio_url.endswith((".wav", ".mp3", ".m4a", ".flac", ".ogg")):
+                ext = Path(audio_url).suffix
+
+            audio_path = Path(temp_dir) / f"test_audio{ext}"
+
+            # Download with progress
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            with open(audio_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = (downloaded / total_size) * 100
+                        click.echo(f"\r  Progress: {pct:.1f}%", nl=False)
+
+            click.echo()  # New line after progress
+            download_time = time.time() - download_start
+            size_mb = audio_path.stat().st_size / (1024 * 1024)
+            click.echo(f"✅ Downloaded {size_mb:.1f}MB in {download_time:.1f}s\n")
+
+            # Process audio
+            click.echo("🚀 Processing audio...")
+            click.echo("-" * 60)
+            process_start = time.time()
+
+            try:
+                results = processor.diarize_audio(
+                    audio_path=str(audio_path),
+                    episode_url=audio_url,
+                    language=language,
+                )
+                process_time = time.time() - process_start
+
+                click.echo("-" * 60)
+                click.echo(f"✅ Processing complete in {process_time:.1f}s\n")
+
+                # Display results summary
+                click.echo("=" * 60)
+                click.echo("📊 PROCESSING RESULTS")
+                click.echo("=" * 60)
+                click.echo(f"\n⏱️  Performance:")
+                click.echo(f"  Total Processing:    {process_time:.2f}s")
+                click.echo(f"  Audio Duration:      {results['duration']:.2f}s ({results['duration']/60:.2f}min)")
+                click.echo(f"  Real-time Factor:    {results['duration']/process_time:.2f}x")
+                click.echo(f"  GPU Info:            {results['gpu_info'] or 'CPU'}")
+
+                click.echo(f"\n🎙️  Diarization:")
+                click.echo(f"  Total Segments:      {results['num_segments']}")
+                click.echo(f"  Unique Speakers:     {results['num_speakers']}")
+                click.echo(f"  Avg Segment Length:  {results['duration']/results['num_segments']:.2f}s")
+
+                if results.get('episode_quality'):
+                    eq = results['episode_quality']
+                    click.echo(f"\n🎵 Audio Quality (NISQA):")
+                    click.echo(f"  Mean MOS:            {eq['mean_mos']:.2f}")
+                    click.echo(f"  Median MOS:          {eq['median_mos']:.2f}")
+                    click.echo(f"  High Quality Segs:   {eq['high_quality_segments']}")
+                    click.echo(f"  Medium Quality Segs: {eq['medium_quality_segments']}")
+                    click.echo(f"  Low Quality Segs:    {eq['low_quality_segments']}")
+
+                if results.get('clipping_stats'):
+                    cs = results['clipping_stats']
+                    click.echo(f"\n📉 Clipping Stats:")
+                    click.echo(f"  Segments w/ Clip:    {cs['segments_with_clipping']}/{results['num_segments']}")
+                    click.echo(f"  Max Clip Rate:       {cs['max_clip_rate']:.4f}")
+
+                if results.get('loudness_stats'):
+                    ls = results['loudness_stats']
+                    click.echo(f"\n🔊 Loudness Stats:")
+                    click.echo(f"  Mean RMS:            {ls['mean_rms_db']:.1f} dB")
+                    click.echo(f"  Mean Peak:           {ls['mean_peak_db']:.1f} dB")
+                    click.echo(f"  Dynamic Range:       {ls['mean_dynamic_range_db']:.1f} dB")
+
+                # Sample transcriptions
+                click.echo(f"\n📝 Sample Transcriptions (first 3 segments):")
+                for i, seg in enumerate(results['segments'][:3]):
+                    text = seg.get('transcription', '').strip()
+                    if text:
+                        click.echo(f"  [{seg['start']:.1f}s] Speaker {seg['speaker']}: {text[:80]}{'...' if len(text) > 80 else ''}")
+
+                click.echo("\n" + "=" * 60)
+                click.echo("✅ TEST COMPLETE")
+                click.echo("=" * 60)
+
+                # Offer to save results
+                if click.confirm("\n💾 Save results to JSON file?", default=False):
+                    output_file = f"test_results_{int(time.time())}.json"
+                    with open(output_file, 'w') as f:
+                        json.dump(results, f, indent=2)
+                    click.echo(f"✅ Results saved to {output_file}")
+                else:
+                    click.echo("⚠️  Results not saved (test mode)")
+
+            except Exception as e:
+                click.echo(f"\n❌ Processing failed: {e}", err=True)
+                logger.exception("Processing error")
+                raise click.Abort()
+
+    except requests.exceptions.RequestException as e:
+        click.echo(f"❌ Download failed: {e}", err=True)
+        raise click.Abort()
+    except Exception as e:
+        click.echo(f"❌ Test failed: {e}", err=True)
+        logger.exception("Test error")
+        raise click.Abort()
+
+
+@cli.command()
 @click.option("-p", "--port", default=8000, help="Port to run on")
 @click.option("--host", default="0.0.0.0", help="Host to bind to")
 @click.option("--reload", is_flag=True, help="Enable auto-reload for development")
