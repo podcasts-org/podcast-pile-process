@@ -229,3 +229,5 @@ input.jsonl
 
 # S3
 test_s3.py
+
+nogit/*
