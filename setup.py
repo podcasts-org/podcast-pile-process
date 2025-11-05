@@ -39,6 +39,10 @@ setup(
             "soundfile>=0.12.0",
             "nemo_toolkit[asr]>=1.20.0",
             "megatron-core",
+            "torchcodec",
+            "boto3",
+            "torchaudio",
+            "funasr",
         ],
         # Development dependencies
         "dev": [
