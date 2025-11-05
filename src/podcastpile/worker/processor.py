@@ -127,8 +127,6 @@ class AudioProcessor:
         # Set GPU device if specified
         if self.gpu_id is not None:
             try:
-                import torch
-
                 torch.cuda.set_device(self.gpu_id)
                 logger.info(
                     f"Using GPU {self.gpu_id}: {torch.cuda.get_device_name(self.gpu_id)}"
