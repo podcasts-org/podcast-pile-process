@@ -156,16 +156,14 @@ class AudioProcessor:
 
         self.diar_model.eval()
 
-        # Enable FP16 inference for ~1.5x speedup on GPU
+        # Try torch.compile for additional speedup (PyTorch 2.0+)
+        # Note: NeMo models handle FP16 internally via precision settings, not .half()
         if torch.cuda.is_available():
-            self.diar_model = self.diar_model.half()
-
-            # Try torch.compile for additional speedup (PyTorch 2.0+)
             try:
                 self.diar_model = torch.compile(self.diar_model, mode='reduce-overhead')
-                logger.info(f"✓ Diarization model loaded on {map_location} (FP16 + torch.compile)")
+                logger.info(f"✓ Diarization model loaded on {map_location} (torch.compile enabled)")
             except Exception as e:
-                logger.info(f"✓ Diarization model loaded on {map_location} (FP16 enabled)")
+                logger.info(f"✓ Diarization model loaded on {map_location}")
                 logger.debug(f"torch.compile not available: {e}")
         else:
             logger.info(f"✓ Diarization model loaded on {map_location}")
@@ -186,16 +184,14 @@ class AudioProcessor:
 
             self.asr_model.eval()
 
-            # Enable FP16 inference for ~2x speedup on GPU
+            # Try torch.compile for additional speedup (PyTorch 2.0+)
+            # Note: NeMo models handle FP16 internally via precision settings
             if torch.cuda.is_available():
-                self.asr_model = self.asr_model.half()
-
-                # Try torch.compile for additional speedup (PyTorch 2.0+)
                 try:
                     self.asr_model = torch.compile(self.asr_model, mode='reduce-overhead')
-                    logger.info(f"✓ Parakeet ASR model loaded on {map_location} (FP16 + torch.compile)")
+                    logger.info(f"✓ Parakeet ASR model loaded on {map_location} (torch.compile enabled)")
                 except Exception as e:
-                    logger.info(f"✓ Parakeet ASR model loaded on {map_location} (FP16 enabled)")
+                    logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
                     logger.debug(f"torch.compile not available: {e}")
             else:
                 logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
