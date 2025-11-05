@@ -29,7 +29,7 @@ from podcastpile.nisqa import NISQAPredictor
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.1.7"
+WORKER_VERSION = "0.3.2"  # In-memory + torchaudio GPU + FP16 (BGM/NISQA)
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -155,18 +155,7 @@ class AudioProcessor:
                 self.diar_model = self.diar_model.to(map_location)
 
         self.diar_model.eval()
-
-        # Try torch.compile for additional speedup (PyTorch 2.0+)
-        # Note: NeMo models handle FP16 internally via precision settings, not .half()
-        if torch.cuda.is_available():
-            try:
-                self.diar_model = torch.compile(self.diar_model, mode='reduce-overhead')
-                logger.info(f"✓ Diarization model loaded on {map_location} (torch.compile enabled)")
-            except Exception as e:
-                logger.info(f"✓ Diarization model loaded on {map_location}")
-                logger.debug(f"torch.compile not available: {e}")
-        else:
-            logger.info(f"✓ Diarization model loaded on {map_location}")
+        logger.info(f"✓ Diarization model loaded on {map_location}")
 
         # Determine which ASR models to load based on languages
         needs_chinese = "zh" in self.languages or "cn" in self.languages
@@ -183,18 +172,7 @@ class AudioProcessor:
                 self.asr_model = self.asr_model.to(f"cuda:{self.gpu_id}")
 
             self.asr_model.eval()
-
-            # Try torch.compile for additional speedup (PyTorch 2.0+)
-            # Note: NeMo models handle FP16 internally via precision settings
-            if torch.cuda.is_available():
-                try:
-                    self.asr_model = torch.compile(self.asr_model, mode='reduce-overhead')
-                    logger.info(f"✓ Parakeet ASR model loaded on {map_location} (torch.compile enabled)")
-                except Exception as e:
-                    logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
-                    logger.debug(f"torch.compile not available: {e}")
-            else:
-                logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
+            logger.info(f"✓ Parakeet ASR model loaded on {map_location}")
 
         # Load Paraformer (Chinese) if needed
         if needs_chinese:
@@ -255,7 +233,7 @@ class AudioProcessor:
                 device=device,
                 dim=True,
                 fp16=True,  # Enable FP16 inference
-                compile_model=True  # Enable torch.compile for additional speedup
+                compile_model=False  # Disabled: incompatible with pack_padded_sequence
             )
             logger.info(f"✓ NISQA model loaded on {device} (FP16: {self.nisqa_predictor.fp16})")
         except Exception as e:

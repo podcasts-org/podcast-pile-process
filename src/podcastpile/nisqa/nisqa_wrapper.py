@@ -23,7 +23,7 @@ class NISQAPredictor:
                  device: Optional[torch.device] = None,
                  dim: bool = True,
                  fp16: bool = True,
-                 compile_model: bool = True):
+                 compile_model: bool = False):
         """
         Initialize NISQA predictor.
 
