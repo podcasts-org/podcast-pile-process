@@ -590,6 +590,7 @@ def download_all(
     download_tasks = []
     filtered_by_mos = 0
     total_high_quality_segments = 0  # Count segments with MOS >= threshold
+    segment_durations = []  # Track durations of high-quality segments
 
     for i, (sha256_hash, s3_info) in enumerate(s3_mapping.items()):
         if s3_info is None:
@@ -614,6 +615,10 @@ def download_all(
                         mos = segment.get('quality_mos')
                         if mos is not None and mos >= min_mos:
                             total_high_quality_segments += 1
+                            # Track duration
+                            duration = segment.get('duration')
+                            if duration is not None:
+                                segment_durations.append(duration)
                 except:
                     pass
 
@@ -630,7 +635,24 @@ def download_all(
         print(f"   Total segments with MOS ≥{min_mos}: {total_high_quality_segments:,}")
         print(f"   Files with at least 1 segment ≥{min_mos}: {len(download_tasks):,}")
         print(f"   Files filtered out: {filtered_by_mos:,}")
-        print(f"   Average high-quality segments per file: {total_high_quality_segments / len(download_tasks):.1f}" if download_tasks else "   No files to download")
+        print(f"   Avg high-quality segments per file: {total_high_quality_segments / len(download_tasks):.1f}" if download_tasks else "   No files to download")
+
+        if segment_durations:
+            import statistics
+            total_duration = sum(segment_durations)
+            avg_duration = statistics.mean(segment_durations)
+            median_duration = statistics.median(segment_durations)
+            min_duration = min(segment_durations)
+            max_duration = max(segment_durations)
+            std_dev = statistics.stdev(segment_durations) if len(segment_durations) > 1 else 0
+
+            print(f"\n📊 Duration Stats (high-quality segments only):")
+            print(f"   Total duration: {total_duration:,.1f}s ({total_duration/3600:.1f} hours)")
+            print(f"   Average: {avg_duration:.2f}s")
+            print(f"   Median: {median_duration:.2f}s")
+            print(f"   Min: {min_duration:.2f}s")
+            print(f"   Max: {max_duration:.2f}s")
+            print(f"   Std dev: {std_dev:.2f}s")
 
     print(f"\nPrepared {len(download_tasks):,} download tasks")
 
