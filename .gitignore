@@ -231,3 +231,7 @@ input.jsonl
 test_s3.py
 
 nogit/*
+
+hashes.txt
+hashes.json
+output/*
