@@ -53,7 +53,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "ppcli=podcastpile.cli:main",
+            "ppcliv2=podcastpile.cli:main",
         ],
     },
     python_requires=">=3.9",
