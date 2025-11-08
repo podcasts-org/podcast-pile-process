@@ -41,19 +41,17 @@ def collect_snippets(input_dir: Path) -> List[Dict]:
             print(f"Warning: Failed to load {json_path}: {e}", file=sys.stderr)
             continue
 
+        # Skip if transcription is empty
+        transcription = metadata.get('transcription', '').strip()
+        if not transcription:
+            continue
+
         # Create dataset entry
         entry = {
             'audio': str(audio_path),
-            'transcription': metadata.get('transcription', ''),
+            'transcription': transcription,
             'language': metadata.get('language', ''),
-            'speaker': metadata.get('speaker', ''),
-            'duration': metadata.get('duration', 0.0),
             'quality_mos': metadata.get('quality_mos', 0.0),
-            'start_time': metadata.get('start_time', 0.0),
-            'end_time': metadata.get('end_time', 0.0),
-            'original_sha256': metadata.get('original_sha256', ''),
-            'original_file': metadata.get('original_file', ''),
-            'segment_index': metadata.get('segment_index', -1),
         }
 
         snippets.append(entry)
@@ -96,6 +94,10 @@ def push_to_hf(
     # Cast audio column
     print("🎵 Casting audio column...")
     ds = ds.cast_column('audio', Audio(sampling_rate=sampling_rate))
+
+    # Shuffle dataset
+    print("🔀 Shuffling dataset...")
+    ds = ds.shuffle(seed=42)
 
     # Push to hub
     print(f"\n📤 Pushing to Hugging Face: {dataset_name}")
