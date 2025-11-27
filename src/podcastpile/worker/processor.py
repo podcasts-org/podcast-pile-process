@@ -743,18 +743,16 @@ def print_global_stats_rich(stats: Dict[str, Any]):
             f"[green]{completed}[/] done"
         )
 
-    # Build the panel content
+    # Build subtitle with per-GPU details
+    subtitle = ""
     if gpu_details:
-        gpu_text = " │ ".join(gpu_details)
-        panel_content = f"{table.render(console)}\n[dim]─[/] {gpu_text}"
-    else:
-        panel_content = table
+        subtitle = " │ ".join(gpu_details)
 
     # Print panel
     panel = Panel(
         table,
         title="[bold blue]📊 Worker Stats[/]",
-        subtitle=f"[dim]{gpu_details[0] if len(gpu_details) == 1 else ' │ '.join(gpu_details) if gpu_details else ''}[/]",
+        subtitle=f"[dim]{subtitle}[/]" if subtitle else None,
         border_style="blue",
         padding=(0, 1),
     )
