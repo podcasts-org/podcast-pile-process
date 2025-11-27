@@ -370,9 +370,21 @@ def worker(
         click.echo("  pip install nemo_toolkit[asr] librosa soundfile", err=True)
         raise click.Abort()
 
+    # Adaptive mode uses all GPUs automatically - don't allow combining with --all-gpus
+    if adaptive and all_gpus:
+        click.echo("Error: --adaptive already uses all GPUs automatically. Don't use --all-gpus with --adaptive.", err=True)
+        raise click.Abort()
+
     # Determine which GPUs to use
     gpu_list = []
-    if all_gpus:
+    if adaptive:
+        # Adaptive mode: use all available GPUs
+        gpu_list = get_available_gpus()
+        if not gpu_list:
+            click.echo("No GPUs available for adaptive mode!", err=True)
+            raise click.Abort()
+        click.echo(f"Adaptive mode: using all {len(gpu_list)} GPUs: {gpu_list}")
+    elif all_gpus:
         gpu_list = get_available_gpus()
         if not gpu_list:
             click.echo("No GPUs available!", err=True)

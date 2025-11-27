@@ -2173,18 +2173,19 @@ class PodcastPileWorker:
 
                     last_ramp_check = now
 
-                    # Update stats
-                    if shared_stats:
-                        stats = memory_monitor.get_memory_stats()
-                        if stats:
-                            shared_stats.update_gpu_stats(gpu_id, {
-                                "current_concurrency": current_target,
-                                "active_jobs": len(active_workers) + 1,  # +1 for main process
-                                "max_concurrency": max_concurrency,
-                                "memory_used_mb": stats.used_mb,
-                                "memory_total_mb": stats.total_mb,
-                                "memory_utilization_pct": stats.utilization_pct,
-                            })
+                # Update stats more frequently (every ramp check)
+                if shared_stats:
+                    stats = memory_monitor.get_memory_stats()
+                    if stats:
+                        shared_stats.update_gpu_stats(gpu_id, {
+                            "current_concurrency": current_target,
+                            "active_jobs": len(active_workers) + 1,  # +1 for main process
+                            "max_concurrency": max_concurrency,
+                            "memory_used_mb": stats.used_mb,
+                            "memory_total_mb": stats.total_mb,
+                            "memory_utilization_pct": stats.utilization_pct,
+                            "jobs_completed": shared_stats._global.get("total_completed", 0),
+                        })
 
                 # Spawn more workers if needed (current_target - 1 because main process is worker 0)
                 workers_needed = current_target - 1 - len(active_workers)
