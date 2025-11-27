@@ -298,6 +298,8 @@ def manager(port, host, reload, workers):
 @click.option("--gpu", type=int, help="GPU device ID to use (e.g., 0, 1, 2)")
 @click.option("--all-gpus", is_flag=True, help="Spawn a worker on each available GPU")
 @click.option("--gpus", help='Comma-separated list of GPU IDs to use (e.g., "0,1,3")')
+@click.option("--adaptive", is_flag=True, help="Enable adaptive concurrency - dynamically spawns worker subprocesses based on available VRAM")
+@click.option("--max-concurrency", default=4, type=int, help="Max concurrent worker processes in adaptive mode (default: 4)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option(
     "--s3-endpoint",
@@ -340,6 +342,8 @@ def worker(
     gpu,
     all_gpus,
     gpus,
+    adaptive,
+    max_concurrency,
     verbose,
     s3_endpoint,
     s3_access_key,
@@ -366,9 +370,21 @@ def worker(
         click.echo("  pip install nemo_toolkit[asr] librosa soundfile", err=True)
         raise click.Abort()
 
+    # Adaptive mode uses all GPUs automatically - don't allow combining with --all-gpus
+    if adaptive and all_gpus:
+        click.echo("Error: --adaptive already uses all GPUs automatically. Don't use --all-gpus with --adaptive.", err=True)
+        raise click.Abort()
+
     # Determine which GPUs to use
     gpu_list = []
-    if all_gpus:
+    if adaptive:
+        # Adaptive mode: use all available GPUs
+        gpu_list = get_available_gpus()
+        if not gpu_list:
+            click.echo("No GPUs available for adaptive mode!", err=True)
+            raise click.Abort()
+        click.echo(f"Adaptive mode: using all {len(gpu_list)} GPUs: {gpu_list}")
+    elif all_gpus:
         gpu_list = get_available_gpus()
         if not gpu_list:
             click.echo("No GPUs available!", err=True)
@@ -394,8 +410,18 @@ def worker(
         import multiprocessing
         import signal
         import sys
+        from multiprocessing import Manager as MPManager
 
         click.echo(f"\nSpawning {len(gpu_list)} workers...")
+
+        # Create shared stats manager for cross-process stats
+        mp_manager = MPManager()
+
+        # Import shared stats class
+        from podcastpile.worker import SharedWorkerStats, GlobalStatsReporter
+
+        shared_stats = SharedWorkerStats(manager=mp_manager)
+        stats_reporter = GlobalStatsReporter(shared_stats, interval=30.0)
 
         processes = []
         base_worker_id = worker_id or socket.gethostname()
@@ -429,21 +455,28 @@ def worker(
                     once,
                     poll_interval,
                     gpu_id,
+                    adaptive,
+                    max_concurrency,
                     verbose,
                     s3_endpoint,
                     s3_access_key,
                     s3_secret_key,
                     s3_bucket,
                     s3_region,
+                    shared_stats,  # Pass shared stats to worker
                 ),
             )
             p.start()
             processes.append(p)
-            click.echo(f"  ✓ Started worker {wid} (PID: {p.pid})")
+            mode_str = f"adaptive (max {max_concurrency})" if adaptive else "standard"
+            click.echo(f"  ✓ Started worker {wid} (PID: {p.pid}, mode: {mode_str})")
 
         click.echo(
             f"\nAll {len(gpu_list)} workers running. Press Ctrl+C to stop all workers."
         )
+
+        # Start the global stats reporter
+        stats_reporter.start()
 
         # Wait for processes or shutdown signal
         try:
@@ -466,6 +499,10 @@ def worker(
             click.echo("\n\nShutdown requested. Terminating workers...")
             click.echo("Note: Jobs in progress will remain in 'processing' state for manager cleanup")
 
+            # Stop stats reporter and print final stats
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
+
             # Send terminate signal to all workers
             for p in processes:
                 if p.is_alive():
@@ -482,7 +519,12 @@ def worker(
             click.echo("All workers stopped")
         else:
             # Workers died unexpectedly, just inform the user
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
             click.echo("One or more workers stopped unexpectedly. Check logs for details.")
+
+        # Cleanup
+        shared_stats.cleanup()
 
     else:
         # Single worker mode
@@ -493,6 +535,11 @@ def worker(
                 if gpu_id is not None
                 else socket.gethostname()
             )
+
+        # For single worker, create local shared stats for reporting
+        from podcastpile.worker import SharedWorkerStats, GlobalStatsReporter
+        shared_stats = SharedWorkerStats()
+        stats_reporter = GlobalStatsReporter(shared_stats, interval=30.0)
 
         _run_single_worker(
             manager,
@@ -505,12 +552,16 @@ def worker(
             once,
             poll_interval,
             gpu_id,
+            adaptive,
+            max_concurrency,
             verbose,
             s3_endpoint,
             s3_access_key,
             s3_secret_key,
             s3_bucket,
             s3_region,
+            shared_stats,
+            stats_reporter,
         )
 
 
@@ -525,12 +576,16 @@ def _run_single_worker(
     once,
     poll_interval,
     gpu_id,
+    adaptive,
+    max_concurrency,
     verbose,
     s3_endpoint,
     s3_access_key,
     s3_secret_key,
     s3_bucket,
     s3_region,
+    shared_stats=None,
+    stats_reporter=None,
 ):
     """Run a single worker instance"""
     import logging
@@ -547,13 +602,16 @@ def _run_single_worker(
 
     from podcastpile.worker import PodcastPileWorker
 
+    mode_str = "Single job" if once else ("Adaptive" if adaptive else "Continuous")
     click.echo(f"Starting Podcast Pile Worker: {worker_id}")
     click.echo(f"  Manager: {manager}")
     click.echo(f"  Languages: {languages}")
     click.echo(f"  Config: {config}")
     click.echo(f"  Batch size: {batch_size}")
     click.echo(f"  GPU: {gpu_id if gpu_id is not None else 'auto'}")
-    click.echo(f"  Mode: {'Single job' if once else 'Continuous'}")
+    click.echo(f"  Mode: {mode_str}")
+    if adaptive:
+        click.echo(f"  Max concurrent jobs: {max_concurrency}")
     click.echo()
 
     # Create S3 config if credentials are provided
@@ -597,6 +655,12 @@ def _run_single_worker(
         click.echo(f"Error loading models: {e}", err=True)
         raise click.Abort()
 
+    # Start stats reporter if we have one and it's a single-worker scenario
+    # (for multi-worker, the main process handles reporting)
+    own_reporter = stats_reporter is not None
+    if own_reporter and not once:
+        stats_reporter.start()
+
     # Run worker
     try:
         if once:
@@ -606,8 +670,17 @@ def _run_single_worker(
                 click.echo("✓ Job processed successfully")
             else:
                 click.echo("No jobs available")
+        elif adaptive:
+            # Adaptive concurrent mode
+            click.echo("Running in ADAPTIVE mode - will auto-scale concurrent jobs")
+            worker_instance.run_loop_adaptive(
+                languages=languages,
+                poll_interval=poll_interval,
+                max_concurrency=max_concurrency,
+                shared_stats=shared_stats,
+            )
         else:
-            # Continuous mode
+            # Standard continuous mode
             worker_instance.run_loop(languages=languages, poll_interval=poll_interval)
     except KeyboardInterrupt:
         click.echo("\n\nWorker stopped by user")
@@ -615,6 +688,13 @@ def _run_single_worker(
         click.echo(f"Error running worker: {e}", err=True)
         logger.exception("Worker error")
         raise click.Abort()
+    finally:
+        # Stop stats reporter and print final stats
+        if own_reporter and stats_reporter:
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
+            if shared_stats:
+                shared_stats.cleanup()
 
 
 @cli.command()

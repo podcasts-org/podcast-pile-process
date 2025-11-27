@@ -43,6 +43,8 @@ setup(
             "boto3",
             "torchaudio",
             "funasr",
+            "nvidia-ml-py",
+            "rich"
         ],
         # Development dependencies
         "dev": [

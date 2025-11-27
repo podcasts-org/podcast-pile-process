@@ -6,14 +6,20 @@ Worker processor for Podcast Pile - diarizes audio and uploads results
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import tempfile
 import threading
 import time
 import uuid
 import datetime
+import gc
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass, field
+from multiprocessing import Manager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Callable, Any
 
 import librosa
 import nemo.collections.asr as nemo_asr
@@ -29,7 +35,7 @@ from podcastpile.nisqa import NISQAPredictor
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.3.2"  # In-memory + torchaudio GPU + FP16 (BGM/NISQA)
+WORKER_VERSION = "0.5.0"  # Subprocess-based adaptive concurrency (safe multi-job per GPU)
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -56,6 +62,768 @@ def get_available_gpus() -> list:
     except Exception:
         pass
     return []
+
+
+@dataclass
+class GPUMemoryStats:
+    """GPU memory statistics"""
+    total_mb: float
+    used_mb: float
+    free_mb: float
+    utilization_pct: float
+
+    @property
+    def available_mb(self) -> float:
+        """Memory available for new work (conservative estimate)"""
+        return self.free_mb
+
+    @property
+    def is_low(self) -> bool:
+        """Check if memory is critically low (<15% free)"""
+        return self.utilization_pct > 85.0
+
+    @property
+    def is_very_low(self) -> bool:
+        """Check if memory is dangerously low (<10% free)"""
+        return self.utilization_pct > 90.0
+
+
+class GPUMemoryMonitor:
+    """
+    Monitors GPU memory usage and provides safe concurrency recommendations.
+
+    The monitor tracks memory usage history and uses conservative estimates
+    to prevent OOM errors while maximizing GPU utilization.
+    """
+
+    # Safety buffer: always keep this much memory free (MB)
+    SAFETY_BUFFER_MB = 1024  # 1GB safety buffer
+
+    # Minimum free memory percentage to allow new jobs
+    MIN_FREE_PCT = 15.0
+
+    # Memory usage history for smoothing
+    HISTORY_SIZE = 10
+
+    def __init__(self, gpu_id: int):
+        self.gpu_id = gpu_id
+        self._history: deque = deque(maxlen=self.HISTORY_SIZE)
+        self._lock = threading.Lock()
+        self._peak_usage_mb = 0.0
+        self._job_memory_estimates: deque = deque(maxlen=50)  # Recent job memory usage
+
+    def get_memory_stats(self) -> Optional[GPUMemoryStats]:
+        """Get current GPU memory statistics"""
+        try:
+            # Use nvidia-smi for more accurate readings (includes all processes)
+            total = torch.cuda.get_device_properties(self.gpu_id).total_memory
+            # Get memory allocated by this process
+            allocated = torch.cuda.memory_allocated(self.gpu_id)
+            # Get memory reserved by this process (includes cached allocations)
+            reserved = torch.cuda.memory_reserved(self.gpu_id)
+
+            # For a more accurate "used" reading, we use nvidia-smi via pynvml
+            # But fall back to reserved if pynvml isn't available
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_id)
+                info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+                used = info.used
+                free = info.free
+            except ImportError:
+                # Fallback: use torch's reserved memory as estimate
+                # This is less accurate but still useful
+                used = reserved
+                free = total - reserved
+
+            total_mb = total / (1024 * 1024)
+            used_mb = used / (1024 * 1024)
+            free_mb = free / (1024 * 1024)
+            utilization_pct = (used_mb / total_mb) * 100 if total_mb > 0 else 0
+
+            stats = GPUMemoryStats(
+                total_mb=total_mb,
+                used_mb=used_mb,
+                free_mb=free_mb,
+                utilization_pct=utilization_pct
+            )
+
+            with self._lock:
+                self._history.append(stats)
+                self._peak_usage_mb = max(self._peak_usage_mb, used_mb)
+
+            return stats
+
+        except Exception as e:
+            logger.warning(f"Failed to get GPU memory stats: {e}")
+            return None
+
+    def record_job_memory_usage(self, memory_mb: float):
+        """Record memory usage from a completed job for estimation"""
+        with self._lock:
+            self._job_memory_estimates.append(memory_mb)
+
+    def get_estimated_job_memory_mb(self) -> float:
+        """
+        Estimate memory needed for a new job based on history.
+        Uses conservative estimate (75th percentile of recent jobs).
+        """
+        with self._lock:
+            if not self._job_memory_estimates:
+                # Default estimate if no history: 4GB per job (conservative)
+                return 4096.0
+
+            estimates = list(self._job_memory_estimates)
+
+        # Use 75th percentile for conservative estimate
+        estimates.sort()
+        idx = int(len(estimates) * 0.75)
+        return estimates[min(idx, len(estimates) - 1)]
+
+    def get_safe_concurrent_jobs(self, current_jobs: int = 0) -> int:
+        """
+        Calculate safe number of concurrent jobs based on available memory.
+
+        Returns the recommended total number of concurrent jobs (not additional jobs).
+        """
+        stats = self.get_memory_stats()
+        if not stats:
+            # Can't determine memory, play it safe
+            return max(1, current_jobs)
+
+        estimated_job_memory = self.get_estimated_job_memory_mb()
+
+        # Available memory for new jobs (with safety buffer)
+        available_mb = stats.free_mb - self.SAFETY_BUFFER_MB
+
+        if available_mb <= 0:
+            # Memory is too low, don't start new jobs
+            return current_jobs
+
+        # Calculate how many additional jobs we can fit
+        additional_jobs = int(available_mb / estimated_job_memory)
+
+        # Cap at reasonable maximum (diminishing returns beyond ~4 concurrent jobs)
+        max_concurrent = 4
+
+        recommended = min(current_jobs + additional_jobs, max_concurrent)
+
+        # Never recommend less than 1 if we have any free memory
+        return max(1, recommended)
+
+    def should_throttle(self) -> bool:
+        """
+        Check if we should throttle (pause new jobs) due to memory pressure.
+
+        Returns True if memory is critically low.
+        """
+        stats = self.get_memory_stats()
+        if not stats:
+            return False  # Can't determine, don't throttle
+
+        return stats.is_very_low
+
+    def can_start_new_job(self) -> bool:
+        """
+        Check if it's safe to start a new job.
+
+        More conservative than should_throttle - used before job acquisition.
+        """
+        stats = self.get_memory_stats()
+        if not stats:
+            return True  # Can't determine, allow it
+
+        # Need at least estimated job memory + safety buffer free
+        estimated_job_memory = self.get_estimated_job_memory_mb()
+        required_free = estimated_job_memory + self.SAFETY_BUFFER_MB
+
+        return stats.free_mb >= required_free
+
+    def force_memory_cleanup(self):
+        """Force GPU memory cleanup via garbage collection and cache clearing"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(self.gpu_id)
+        logger.info(f"GPU {self.gpu_id}: Forced memory cleanup")
+
+
+@dataclass
+class AdaptiveJobSlot:
+    """Represents a job slot with memory tracking"""
+    job_id: int
+    future: Optional[Future] = None
+    start_time: float = field(default_factory=time.time)
+    memory_before_mb: float = 0.0
+    memory_peak_mb: float = 0.0
+
+
+class AdaptiveJobScheduler:
+    """
+    Intelligently schedules concurrent jobs to maximize GPU utilization
+    while preventing OOM errors.
+
+    Features:
+    - Starts conservative (1 job) and ramps up based on observed memory usage
+    - Continuously monitors GPU memory and adjusts concurrency
+    - Backs off immediately when memory gets tight
+    - Learns from job memory patterns over time
+    - Gracefully handles OOM by reducing concurrency
+    """
+
+    # Initial number of concurrent jobs (conservative start)
+    INITIAL_CONCURRENCY = 1
+
+    # How often to check memory and adjust (seconds)
+    MEMORY_CHECK_INTERVAL = 2.0
+
+    # Cooldown after reducing concurrency (seconds)
+    BACKOFF_COOLDOWN = 30.0
+
+    # Minimum time between concurrency increases (seconds)
+    RAMP_UP_INTERVAL = 60.0
+
+    def __init__(
+        self,
+        gpu_id: int,
+        job_processor: Callable,
+        max_concurrency: int = 4
+    ):
+        """
+        Initialize the adaptive scheduler.
+
+        Args:
+            gpu_id: GPU device ID to manage
+            job_processor: Callable that processes a single job (takes job dict, returns bool)
+            max_concurrency: Maximum number of concurrent jobs (default: 4)
+        """
+        self.gpu_id = gpu_id
+        self.job_processor = job_processor
+        self.max_concurrency = max_concurrency
+
+        self.memory_monitor = GPUMemoryMonitor(gpu_id)
+        self._current_concurrency = self.INITIAL_CONCURRENCY
+        self._target_concurrency = self.INITIAL_CONCURRENCY
+
+        self._active_slots: Dict[int, AdaptiveJobSlot] = {}
+        self._slot_lock = threading.Lock()
+
+        self._last_ramp_up = 0.0
+        self._last_backoff = 0.0
+        self._consecutive_successes = 0
+        self._consecutive_failures = 0
+
+        self._shutdown = False
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+        # Stats
+        self._jobs_completed = 0
+        self._jobs_failed = 0
+        self._oom_events = 0
+
+    @property
+    def current_concurrency(self) -> int:
+        """Current target concurrency level"""
+        return self._current_concurrency
+
+    @property
+    def active_jobs(self) -> int:
+        """Number of currently running jobs"""
+        with self._slot_lock:
+            return len(self._active_slots)
+
+    def _record_memory_before_job(self, job_id: int) -> float:
+        """Record memory usage before starting a job"""
+        stats = self.memory_monitor.get_memory_stats()
+        return stats.used_mb if stats else 0.0
+
+    def _record_job_completion(self, job_id: int, success: bool, memory_before: float):
+        """Record job completion and update memory estimates"""
+        stats = self.memory_monitor.get_memory_stats()
+        memory_after = stats.used_mb if stats else memory_before
+
+        # Estimate memory used by this job (peak during processing)
+        # This is approximate but helps tune future estimates
+        with self._slot_lock:
+            slot = self._active_slots.get(job_id)
+            if slot:
+                # Use the difference as a rough estimate
+                # Note: This is imprecise due to shared memory, but useful for trending
+                estimated_usage = max(0, memory_after - memory_before + 1024)  # Add buffer
+                self.memory_monitor.record_job_memory_usage(estimated_usage)
+
+        if success:
+            self._jobs_completed += 1
+            self._consecutive_successes += 1
+            self._consecutive_failures = 0
+
+            # Consider ramping up if we've had consistent success
+            if self._consecutive_successes >= 3:
+                self._consider_ramp_up()
+        else:
+            self._jobs_failed += 1
+            self._consecutive_failures += 1
+            self._consecutive_successes = 0
+
+            # Back off on failures
+            if self._consecutive_failures >= 2:
+                self._force_backoff("consecutive failures")
+
+    def _consider_ramp_up(self):
+        """Consider increasing concurrency if conditions are right"""
+        now = time.time()
+
+        # Don't ramp up too quickly
+        if now - self._last_ramp_up < self.RAMP_UP_INTERVAL:
+            return
+
+        # Don't ramp up if we recently backed off
+        if now - self._last_backoff < self.BACKOFF_COOLDOWN:
+            return
+
+        # Check if memory allows more jobs
+        recommended = self.memory_monitor.get_safe_concurrent_jobs(self.active_jobs)
+
+        if recommended > self._current_concurrency and self._current_concurrency < self.max_concurrency:
+            new_concurrency = min(self._current_concurrency + 1, self.max_concurrency, recommended)
+            logger.info(
+                f"GPU {self.gpu_id}: Ramping up concurrency {self._current_concurrency} -> {new_concurrency} "
+                f"(memory allows {recommended}, {self._consecutive_successes} consecutive successes)"
+            )
+            self._current_concurrency = new_concurrency
+            self._last_ramp_up = now
+            self._consecutive_successes = 0
+
+    def _force_backoff(self, reason: str):
+        """Force reduce concurrency"""
+        if self._current_concurrency > 1:
+            old = self._current_concurrency
+            self._current_concurrency = max(1, self._current_concurrency - 1)
+            self._last_backoff = time.time()
+            logger.warning(
+                f"GPU {self.gpu_id}: Backing off concurrency {old} -> {self._current_concurrency} "
+                f"(reason: {reason})"
+            )
+
+            # Force memory cleanup
+            self.memory_monitor.force_memory_cleanup()
+
+    def _handle_oom(self):
+        """Handle an OOM event"""
+        self._oom_events += 1
+        logger.error(f"GPU {self.gpu_id}: OOM detected! Total OOM events: {self._oom_events}")
+
+        # Aggressive backoff on OOM
+        self._current_concurrency = 1
+        self._last_backoff = time.time()
+
+        # Force cleanup
+        self.memory_monitor.force_memory_cleanup()
+
+        # Extra wait for memory to settle
+        time.sleep(5.0)
+
+    def _memory_watchdog(self):
+        """Background thread that monitors memory and adjusts concurrency"""
+        logger.info(f"GPU {self.gpu_id}: Memory watchdog started")
+
+        while not self._shutdown:
+            try:
+                stats = self.memory_monitor.get_memory_stats()
+
+                if stats:
+                    # Log memory status periodically
+                    logger.debug(
+                        f"GPU {self.gpu_id}: Memory {stats.used_mb:.0f}/{stats.total_mb:.0f}MB "
+                        f"({stats.utilization_pct:.1f}% used), {self.active_jobs} active jobs, "
+                        f"concurrency={self._current_concurrency}"
+                    )
+
+                    # Check for memory pressure
+                    if stats.is_very_low:
+                        logger.warning(
+                            f"GPU {self.gpu_id}: Critical memory pressure! "
+                            f"{stats.free_mb:.0f}MB free ({100-stats.utilization_pct:.1f}%)"
+                        )
+                        self._force_backoff("critical memory pressure")
+                    elif stats.is_low and self.active_jobs > 1:
+                        logger.info(
+                            f"GPU {self.gpu_id}: Memory pressure detected, "
+                            f"will not start new jobs until current complete"
+                        )
+
+                time.sleep(self.MEMORY_CHECK_INTERVAL)
+
+            except Exception as e:
+                logger.error(f"GPU {self.gpu_id}: Watchdog error: {e}")
+                time.sleep(self.MEMORY_CHECK_INTERVAL)
+
+        logger.info(f"GPU {self.gpu_id}: Memory watchdog stopped")
+
+    def _process_job_wrapper(self, job: Dict) -> bool:
+        """Wrapper that handles memory tracking and OOM detection"""
+        job_id = job.get("job_id", 0)
+        memory_before = self._record_memory_before_job(job_id)
+
+        # Create slot entry
+        slot = AdaptiveJobSlot(
+            job_id=job_id,
+            memory_before_mb=memory_before
+        )
+
+        with self._slot_lock:
+            self._active_slots[job_id] = slot
+
+        try:
+            # Actually process the job
+            success = self.job_processor(job)
+            self._record_job_completion(job_id, success, memory_before)
+            return success
+
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"GPU {self.gpu_id}: OOM during job #{job_id}: {e}")
+            self._handle_oom()
+            self._record_job_completion(job_id, False, memory_before)
+            return False
+
+        except RuntimeError as e:
+            # CUDA errors often manifest as RuntimeError
+            if "out of memory" in str(e).lower() or "CUDA" in str(e):
+                logger.error(f"GPU {self.gpu_id}: CUDA error during job #{job_id}: {e}")
+                self._handle_oom()
+                self._record_job_completion(job_id, False, memory_before)
+                return False
+            raise
+
+        finally:
+            with self._slot_lock:
+                self._active_slots.pop(job_id, None)
+
+    def can_accept_job(self) -> bool:
+        """Check if scheduler can accept a new job"""
+        if self._shutdown:
+            return False
+
+        # Check if we're at concurrency limit
+        if self.active_jobs >= self._current_concurrency:
+            return False
+
+        # Check memory
+        if not self.memory_monitor.can_start_new_job():
+            logger.debug(f"GPU {self.gpu_id}: Cannot accept job - insufficient memory")
+            return False
+
+        # Check for throttling due to memory pressure
+        if self.memory_monitor.should_throttle():
+            logger.debug(f"GPU {self.gpu_id}: Cannot accept job - throttled due to memory pressure")
+            return False
+
+        return True
+
+    def get_stats(self) -> Dict:
+        """Get scheduler statistics"""
+        stats = self.memory_monitor.get_memory_stats()
+        return {
+            "gpu_id": self.gpu_id,
+            "current_concurrency": self._current_concurrency,
+            "max_concurrency": self.max_concurrency,
+            "active_jobs": self.active_jobs,
+            "jobs_completed": self._jobs_completed,
+            "jobs_failed": self._jobs_failed,
+            "oom_events": self._oom_events,
+            "memory_used_mb": stats.used_mb if stats else None,
+            "memory_total_mb": stats.total_mb if stats else None,
+            "memory_utilization_pct": stats.utilization_pct if stats else None,
+        }
+
+
+class SharedWorkerStats:
+    """
+    Shared statistics collector for multi-process workers.
+
+    Uses multiprocessing.Manager to share stats across processes.
+    Each GPU worker updates its own stats, and the main process
+    aggregates them for display.
+    """
+
+    def __init__(self, manager: Optional[Manager] = None):
+        """
+        Initialize shared stats.
+
+        Args:
+            manager: Optional multiprocessing.Manager instance.
+                     If None, creates a new one (use for single-process mode).
+        """
+        self._own_manager = manager is None
+        self._manager = manager or Manager()
+
+        # Shared dict for per-GPU stats
+        # Key: gpu_id, Value: dict of stats
+        self._gpu_stats = self._manager.dict()
+
+        # Global counters (shared across all processes)
+        self._global = self._manager.dict({
+            "total_completed": 0,
+            "total_failed": 0,
+            "total_oom_events": 0,
+            "workers_spawned": 0,
+            "start_time": time.time(),
+        })
+
+        # Lock for atomic updates
+        self._lock = self._manager.Lock()
+
+    def update_gpu_stats(self, gpu_id: int, stats: Dict[str, Any]):
+        """Update stats for a specific GPU"""
+        with self._lock:
+            self._gpu_stats[gpu_id] = {
+                **stats,
+                "last_update": time.time(),
+            }
+
+    def increment_completed(self, count: int = 1):
+        """Increment global completed counter"""
+        with self._lock:
+            self._global["total_completed"] = self._global.get("total_completed", 0) + count
+
+    def increment_failed(self, count: int = 1):
+        """Increment global failed counter"""
+        with self._lock:
+            self._global["total_failed"] = self._global.get("total_failed", 0) + count
+
+    def increment_oom(self, count: int = 1):
+        """Increment global OOM counter"""
+        with self._lock:
+            self._global["total_oom_events"] = self._global.get("total_oom_events", 0) + count
+
+    def get_all_stats(self) -> Dict[str, Any]:
+        """Get aggregated stats from all GPUs"""
+        with self._lock:
+            gpu_stats = dict(self._gpu_stats)
+            global_stats = dict(self._global)
+
+        # Calculate aggregates
+        total_active = sum(s.get("active_jobs", 0) for s in gpu_stats.values())
+        total_concurrency = sum(s.get("current_concurrency", 0) for s in gpu_stats.values())
+        max_concurrency = sum(s.get("max_concurrency", 0) for s in gpu_stats.values())
+
+        # Memory stats
+        total_memory_used = sum(s.get("memory_used_mb", 0) or 0 for s in gpu_stats.values())
+        total_memory_total = sum(s.get("memory_total_mb", 0) or 0 for s in gpu_stats.values())
+        avg_memory_pct = (
+            (total_memory_used / total_memory_total * 100)
+            if total_memory_total > 0 else 0
+        )
+
+        # Uptime
+        uptime_seconds = time.time() - global_stats.get("start_time", time.time())
+
+        # Throughput
+        total_completed = global_stats.get("total_completed", 0)
+        jobs_per_minute = (total_completed / uptime_seconds * 60) if uptime_seconds > 0 else 0
+
+        return {
+            "gpu_count": len(gpu_stats),
+            "gpu_stats": gpu_stats,
+            "total_active_jobs": total_active,
+            "total_concurrency": total_concurrency,
+            "max_concurrency": max_concurrency,
+            "total_completed": total_completed,
+            "total_failed": global_stats.get("total_failed", 0),
+            "total_oom_events": global_stats.get("total_oom_events", 0),
+            "total_memory_used_mb": total_memory_used,
+            "total_memory_total_mb": total_memory_total,
+            "avg_memory_utilization_pct": avg_memory_pct,
+            "uptime_seconds": uptime_seconds,
+            "jobs_per_minute": jobs_per_minute,
+        }
+
+    def cleanup(self):
+        """Cleanup manager if we own it"""
+        if self._own_manager and self._manager:
+            try:
+                self._manager.shutdown()
+            except:
+                pass
+
+
+def print_global_stats_rich(stats: Dict[str, Any]):
+    """
+    Print global stats using Rich for colorful output.
+
+    This is called from the main process to display aggregated stats.
+    """
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text
+        from rich import box
+    except ImportError:
+        # Fallback to plain text if Rich not available
+        logger.info(
+            f"Stats: {stats['total_completed']} completed, "
+            f"{stats['total_failed']} failed, "
+            f"{stats['total_active_jobs']}/{stats['total_concurrency']} active, "
+            f"{stats['jobs_per_minute']:.1f} jobs/min"
+        )
+        return
+
+    console = Console()
+
+    # Format uptime
+    uptime = stats["uptime_seconds"]
+    hours, remainder = divmod(int(uptime), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    # Create main stats table
+    table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
+    table.add_column("Label", style="dim")
+    table.add_column("Value", justify="right")
+    table.add_column("Label2", style="dim")
+    table.add_column("Value2", justify="right")
+
+    # Row 1: Jobs completed / failed
+    completed_style = "bold green" if stats["total_completed"] > 0 else "white"
+    failed_style = "bold red" if stats["total_failed"] > 0 else "dim"
+    table.add_row(
+        "Completed", f"[{completed_style}]{stats['total_completed']}[/]",
+        "Failed", f"[{failed_style}]{stats['total_failed']}[/]"
+    )
+
+    # Row 2: Workers / throughput
+    workers_str = f"{stats['total_active_jobs']}/{stats['total_concurrency']}"
+    throughput_str = f"{stats['jobs_per_minute']:.2f}/min"
+    table.add_row(
+        "Workers", f"[cyan]{workers_str}[/]",
+        "Throughput", f"[magenta]{throughput_str}[/]"
+    )
+
+    # Row 3: Memory / OOMs
+    mem_pct = stats["avg_memory_utilization_pct"]
+    if mem_pct > 90:
+        mem_style = "bold red"
+    elif mem_pct > 75:
+        mem_style = "yellow"
+    else:
+        mem_style = "green"
+    mem_str = f"{stats['total_memory_used_mb']:.0f}/{stats['total_memory_total_mb']:.0f}MB ({mem_pct:.1f}%)"
+
+    oom_style = "bold red" if stats["total_oom_events"] > 0 else "dim green"
+    table.add_row(
+        "GPU Memory", f"[{mem_style}]{mem_str}[/]",
+        "OOM Events", f"[{oom_style}]{stats['total_oom_events']}[/]"
+    )
+
+    # Row 4: GPUs / Uptime
+    table.add_row(
+        "GPUs", f"[blue]{stats['gpu_count']}[/]",
+        "Uptime", f"[dim]{uptime_str}[/]"
+    )
+
+    # Per-GPU details (if multiple GPUs)
+    gpu_details = []
+    for gpu_id, gpu_stat in sorted(stats.get("gpu_stats", {}).items()):
+        mem_pct = gpu_stat.get("memory_utilization_pct", 0) or 0
+        if mem_pct > 90:
+            mem_color = "red"
+        elif mem_pct > 75:
+            mem_color = "yellow"
+        else:
+            mem_color = "green"
+
+        active = gpu_stat.get("active_jobs", 0)
+        concurrency = gpu_stat.get("current_concurrency", 1)
+        completed = gpu_stat.get("jobs_completed", 0)
+
+        gpu_details.append(
+            f"[bold]GPU {gpu_id}[/]: [{mem_color}]{mem_pct:.0f}%[/] mem, "
+            f"[cyan]{active}/{concurrency}[/] active, "
+            f"[green]{completed}[/] done"
+        )
+
+    # Build subtitle with per-GPU details
+    subtitle = ""
+    if gpu_details:
+        subtitle = " │ ".join(gpu_details)
+
+    # Print panel
+    panel = Panel(
+        table,
+        title="[bold blue]📊 Worker Stats[/]",
+        subtitle=f"[dim]{subtitle}[/]" if subtitle else None,
+        border_style="blue",
+        padding=(0, 1),
+    )
+
+    console.print(panel)
+
+
+class GlobalStatsReporter:
+    """
+    Background thread/process that periodically prints global stats using Rich.
+    """
+
+    def __init__(
+        self,
+        shared_stats: SharedWorkerStats,
+        interval: float = 30.0,
+    ):
+        """
+        Initialize the stats reporter.
+
+        Args:
+            shared_stats: SharedWorkerStats instance to read from
+            interval: How often to print stats (seconds)
+        """
+        self.shared_stats = shared_stats
+        self.interval = interval
+        self._shutdown = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the reporter thread"""
+        self._shutdown = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info(f"Global stats reporter started (interval: {self.interval}s)")
+
+    def stop(self):
+        """Stop the reporter thread"""
+        self._shutdown = True
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self):
+        """Reporter loop"""
+        # Wait a bit before first report to let workers start
+        time.sleep(min(10, self.interval))
+
+        while not self._shutdown:
+            try:
+                stats = self.shared_stats.get_all_stats()
+                print_global_stats_rich(stats)
+            except Exception as e:
+                logger.error(f"Error printing stats: {e}")
+
+            # Sleep in small increments to check for shutdown
+            for _ in range(int(self.interval)):
+                if self._shutdown:
+                    break
+                time.sleep(1)
+
+    def print_final_stats(self):
+        """Print final stats on shutdown"""
+        try:
+            from rich.console import Console
+            console = Console()
+            console.print("\n[bold yellow]═══ Final Stats ═══[/]")
+            stats = self.shared_stats.get_all_stats()
+            print_global_stats_rich(stats)
+        except Exception as e:
+            logger.error(f"Error printing final stats: {e}")
 
 
 class AudioProcessor:
@@ -252,10 +1020,9 @@ class AudioProcessor:
         self.diar_model.sortformer_modules._check_streaming_parameters()
         logger.info(f"✓ Using {self.config_name} configuration")
 
-    @staticmethod
-    def load_audio_torchaudio(audio_path: str, target_sr: int = 16000) -> tuple:
+    def load_audio_torchaudio(self, audio_path: str, target_sr: int = 16000) -> tuple:
         """
-        Load audio using torchaudio (GPU-accelerated if available)
+        Load audio using torchaudio (CPU-based for thread safety in concurrent mode)
 
         Args:
             audio_path: Path to audio file
@@ -271,12 +1038,11 @@ class AudioProcessor:
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        # Resample if needed (GPU-accelerated if CUDA available)
+        # Resample if needed
+        # NOTE: We do resampling on CPU to avoid CUDA race conditions in concurrent mode.
+        # The GPU memory saved by CPU resampling is better used for the actual ML models.
         if sr != target_sr:
             resampler = torchaudio.transforms.Resample(sr, target_sr)
-            if torch.cuda.is_available():
-                waveform = waveform.cuda()
-                resampler = resampler.cuda()
             waveform = resampler(waveform)
             sr = target_sr
 
@@ -858,6 +1624,10 @@ class PodcastPileWorker:
         # Initialize S3 uploader if config provided
         self.s3_uploader = S3Uploader(s3_config) if s3_config else None
 
+        # Lock for GPU operations - NeMo models are NOT thread-safe
+        # This ensures only one job uses GPU at a time
+        self._gpu_lock = threading.Lock()
+
         # Headers for API requests
         self.headers = {}
         if worker_password:
@@ -1240,3 +2010,414 @@ class PodcastPileWorker:
 
         except KeyboardInterrupt:
             logger.info("\nStopping worker...")
+
+    def run_loop_adaptive(
+        self,
+        languages: str = "en",
+        poll_interval: int = 10,
+        max_concurrency: int = 4,
+        shared_stats: Optional['SharedWorkerStats'] = None,
+    ):
+        """
+        Continuously request and process jobs with adaptive concurrency using subprocesses.
+
+        This mode spawns separate worker PROCESSES (not threads) to run concurrent jobs.
+        Each subprocess loads its own copy of the models, which is required because
+        NeMo/PyTorch models are not thread-safe for concurrent GPU execution.
+
+        The scheduler:
+        - Starts conservative with 1 worker process
+        - Monitors GPU memory and spawns more workers when VRAM allows
+        - Each worker has its own model copy (~X GB VRAM per worker)
+        - Backs off by not spawning new workers when memory is tight
+        - Learns typical memory usage per worker over time
+
+        Args:
+            languages: Comma-separated language codes (default: "en")
+            poll_interval: Seconds to wait between requests if no job available
+            max_concurrency: Maximum concurrent worker processes (default: 4)
+            shared_stats: Optional SharedWorkerStats for cross-process stats reporting
+        """
+        logger.info(f"Starting ADAPTIVE worker loop with SUBPROCESS workers...")
+        logger.info(f"Languages: {languages}, Max workers: {max_concurrency}")
+        logger.info("Press Ctrl+C to stop")
+
+        gpu_id = self.gpu_id if self.gpu_id is not None else 0
+        memory_monitor = GPUMemoryMonitor(gpu_id)
+
+        # Get baseline memory (models already loaded in this process)
+        baseline_stats = memory_monitor.get_memory_stats()
+        if baseline_stats:
+            baseline_vram = baseline_stats.used_mb
+            total_vram = baseline_stats.total_mb
+            logger.info(f"Baseline VRAM usage (models loaded): {baseline_vram:.0f}MB / {total_vram:.0f}MB")
+            # Estimate per-worker VRAM (model size)
+            estimated_worker_vram = baseline_vram * 0.9  # Slightly less due to shared CUDA context
+        else:
+            estimated_worker_vram = 8000  # Conservative 8GB default
+            total_vram = 24000
+
+        logger.info(f"Estimated VRAM per worker: ~{estimated_worker_vram:.0f}MB")
+
+        # Safety buffer - always keep this much free
+        safety_buffer_mb = 2000  # 2GB safety buffer
+
+        # Track active worker processes
+        active_workers: Dict[int, multiprocessing.Process] = {}  # worker_id -> Process
+        worker_counter = 0
+
+        # Shared queue for job results (success/failure counts)
+        result_queue = multiprocessing.Queue()
+
+        # Current target concurrency (starts at 1, adapts based on memory)
+        current_target = 1
+        last_ramp_check = time.time()
+        ramp_check_interval = 30.0  # Check for ramp-up every 30s
+        consecutive_successes = 0
+
+        def get_safe_worker_count() -> int:
+            """Calculate how many workers we can safely run based on VRAM"""
+            stats = memory_monitor.get_memory_stats()
+            if not stats:
+                return 1
+
+            available = stats.free_mb - safety_buffer_mb
+            if available <= 0:
+                return max(1, len(active_workers))  # Don't kill existing workers
+
+            # How many MORE workers could we fit?
+            additional = int(available / estimated_worker_vram)
+            total_possible = len(active_workers) + additional
+
+            return min(total_possible, max_concurrency)
+
+        def spawn_worker(worker_num: int) -> multiprocessing.Process:
+            """Spawn a new worker subprocess"""
+            p = multiprocessing.Process(
+                target=_adaptive_worker_subprocess,
+                args=(
+                    self.manager_url,
+                    f"{self.worker_id}-sub{worker_num}",
+                    self.worker_password,
+                    self.processor.config_name,
+                    self.processor.model_path,
+                    gpu_id,
+                    languages,
+                    self.processor.batch_size,
+                    self.s3_uploader.bucket if self.s3_uploader else None,
+                    result_queue,
+                    shared_stats,
+                ),
+                daemon=True
+            )
+            p.start()
+            logger.info(f"Spawned worker subprocess {worker_num} (PID: {p.pid})")
+            return p
+
+        try:
+            # Start with 1 worker
+            # NOTE: We don't spawn here - this process IS the first worker
+            # We'll spawn ADDITIONAL workers as subprocesses
+
+            # This process becomes worker 0 and processes jobs directly
+            logger.info("Main process will handle jobs as worker-0")
+
+            while True:
+                # Check for completed workers and collect results
+                dead_workers = []
+                for wid, proc in active_workers.items():
+                    if not proc.is_alive():
+                        dead_workers.append(wid)
+                        exit_code = proc.exitcode
+                        if exit_code != 0:
+                            logger.warning(f"Worker {wid} died with exit code {exit_code}")
+                        else:
+                            logger.info(f"Worker {wid} exited normally")
+
+                for wid in dead_workers:
+                    del active_workers[wid]
+
+                # Collect results from queue
+                while not result_queue.empty():
+                    try:
+                        result = result_queue.get_nowait()
+                        if result.get("success"):
+                            consecutive_successes += 1
+                            if shared_stats:
+                                shared_stats.increment_completed()
+                        else:
+                            consecutive_successes = 0
+                            if shared_stats:
+                                shared_stats.increment_failed()
+                            if result.get("oom"):
+                                if shared_stats:
+                                    shared_stats.increment_oom()
+                                # OOM - reduce target
+                                current_target = max(1, current_target - 1)
+                                logger.warning(f"OOM detected, reducing target to {current_target}")
+                    except:
+                        break
+
+                # Check if we should adjust concurrency
+                now = time.time()
+                if now - last_ramp_check >= ramp_check_interval:
+                    safe_count = get_safe_worker_count()
+
+                    # Consider ramping up if successful and memory allows
+                    if consecutive_successes >= 3 and safe_count > current_target:
+                        old_target = current_target
+                        current_target = min(current_target + 1, safe_count, max_concurrency)
+                        if current_target > old_target:
+                            logger.info(f"Ramping up: {old_target} -> {current_target} workers (memory allows {safe_count})")
+                            consecutive_successes = 0
+
+                    last_ramp_check = now
+
+                # Update stats more frequently (every ramp check)
+                if shared_stats:
+                    stats = memory_monitor.get_memory_stats()
+                    if stats:
+                        shared_stats.update_gpu_stats(gpu_id, {
+                            "current_concurrency": current_target,
+                            "active_jobs": len(active_workers) + 1,  # +1 for main process
+                            "max_concurrency": max_concurrency,
+                            "memory_used_mb": stats.used_mb,
+                            "memory_total_mb": stats.total_mb,
+                            "memory_utilization_pct": stats.utilization_pct,
+                            "jobs_completed": shared_stats._global.get("total_completed", 0),
+                        })
+
+                # Spawn more workers if needed (current_target - 1 because main process is worker 0)
+                workers_needed = current_target - 1 - len(active_workers)
+                if workers_needed > 0:
+                    # Check memory before spawning
+                    stats = memory_monitor.get_memory_stats()
+                    if stats and stats.free_mb > (estimated_worker_vram + safety_buffer_mb):
+                        worker_counter += 1
+                        proc = spawn_worker(worker_counter)
+                        active_workers[worker_counter] = proc
+                    else:
+                        logger.debug(f"Skipping worker spawn - insufficient memory ({stats.free_mb:.0f}MB free)")
+
+                # Main process handles a job (acts as worker 0)
+                job = self.request_job(languages=languages)
+
+                if job:
+                    job_id = job["job_id"]
+                    logger.info(f"[Main] Processing job #{job_id}")
+                    try:
+                        success = self._process_job_safe(job)
+                        if success:
+                            consecutive_successes += 1
+                            if shared_stats:
+                                shared_stats.increment_completed()
+                        else:
+                            consecutive_successes = 0
+                            if shared_stats:
+                                shared_stats.increment_failed()
+                    except torch.cuda.OutOfMemoryError:
+                        logger.error(f"[Main] OOM on job #{job_id}")
+                        consecutive_successes = 0
+                        current_target = max(1, current_target - 1)
+                        if shared_stats:
+                            shared_stats.increment_failed()
+                            shared_stats.increment_oom()
+                        # Force cleanup
+                        memory_monitor.force_memory_cleanup()
+                        time.sleep(5)
+                    except Exception as e:
+                        logger.error(f"[Main] Error on job #{job_id}: {e}")
+                        consecutive_successes = 0
+                        if shared_stats:
+                            shared_stats.increment_failed()
+                else:
+                    # No jobs available
+                    if not active_workers:
+                        logger.info(f"No jobs available, waiting {poll_interval}s...")
+                        time.sleep(poll_interval)
+                    else:
+                        # Have subprocess workers, they'll pick up jobs
+                        time.sleep(2)
+
+        except KeyboardInterrupt:
+            logger.info("\nShutting down adaptive workers...")
+
+        finally:
+            # Terminate all subprocess workers
+            for wid, proc in active_workers.items():
+                if proc.is_alive():
+                    logger.info(f"Terminating worker {wid}...")
+                    proc.terminate()
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.kill()
+
+            logger.info("Adaptive worker stopped")
+
+    def _process_job_safe(self, job: Dict) -> bool:
+        """
+        Process a job with OOM-safe error handling.
+
+        This is a simplified version of process_job designed for concurrent execution.
+        It doesn't do prefetching (which doesn't make sense with concurrent jobs).
+        """
+        job_id = job["job_id"]
+        episode_url = job["episode_url"]
+        language = job.get("language")
+
+        logger.info(f"[Job #{job_id}] Starting processing...")
+
+        # Update status to processing
+        self.update_job_status(job_id, "processing")
+
+        temp_dir = tempfile.mkdtemp()
+        upload_thread = None
+
+        try:
+            # Download audio
+            audio_path = self.download_audio(episode_url, temp_dir)
+            original_audio_path = audio_path
+
+            # Start S3 upload in background if configured
+            if self.s3_uploader:
+                file_hash = self.processor.compute_file_hashes(original_audio_path)["sha256"]
+                upload_thread = self.s3_uploader.upload_file_threaded(
+                    original_audio_path, file_hash
+                )
+                logger.info(f"[Job #{job_id}] S3 upload started in background")
+
+            # Process audio (GPU work happens here)
+            results = self.processor.diarize_audio(
+                original_audio_path,
+                episode_url=episode_url,
+                language=language,
+            )
+
+            # Submit results
+            success = self.submit_results(job_id, results)
+
+            # Wait for S3 upload to complete
+            if upload_thread:
+                upload_thread.join(timeout=120)  # 2 minute timeout for upload
+
+            logger.info(f"[Job #{job_id}] Completed successfully")
+            return success
+
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"[Job #{job_id}] OOM error: {e}")
+            self.report_failure(job_id, f"OOM: {str(e)}")
+            # Re-raise to let scheduler handle OOM
+            raise
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.error(f"[Job #{job_id}] CUDA OOM error: {e}")
+                self.report_failure(job_id, f"CUDA OOM: {str(e)}")
+                raise torch.cuda.OutOfMemoryError(str(e))
+            else:
+                logger.error(f"[Job #{job_id}] Runtime error: {e}", exc_info=True)
+                self.report_failure(job_id, str(e))
+                return False
+
+        except Exception as e:
+            logger.error(f"[Job #{job_id}] Error: {e}", exc_info=True)
+            self.report_failure(job_id, str(e))
+            return False
+
+        finally:
+            # Cleanup temp directory
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _adaptive_worker_subprocess(
+    manager_url: str,
+    worker_id: str,
+    worker_password: Optional[str],
+    config: str,
+    model_path: Optional[str],
+    gpu_id: int,
+    languages: str,
+    batch_size: int,
+    s3_bucket: Optional[str],
+    result_queue: multiprocessing.Queue,
+    shared_stats: Optional['SharedWorkerStats'],
+):
+    """
+    Worker subprocess that loads its own models and processes jobs continuously.
+
+    This function runs in a separate process spawned by run_loop_adaptive.
+    Each subprocess:
+    1. Loads its own copy of the ML models
+    2. Continuously requests and processes jobs
+    3. Reports results back via the result_queue
+    """
+    import signal
+
+    # Setup logging for this subprocess
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s - [{worker_id}] - %(levelname)s - %(message)s",
+    )
+    sub_logger = logging.getLogger(__name__)
+
+    sub_logger.info(f"Subprocess worker starting on GPU {gpu_id}...")
+
+    # Handle graceful shutdown
+    shutdown_requested = False
+
+    def handle_signal(sig, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        # Create worker instance (this loads models - takes time and VRAM)
+        worker = PodcastPileWorker(
+            manager_url=manager_url,
+            worker_id=worker_id,
+            worker_password=worker_password,
+            config=config,
+            model_path=model_path,
+            gpu_id=gpu_id,
+            languages=languages,
+            batch_size=batch_size,
+            s3_config=None,  # TODO: Pass S3 config if needed
+        )
+
+        sub_logger.info("Loading models...")
+        worker.load_models()
+        sub_logger.info("Models loaded, starting job loop")
+
+        # Process jobs until shutdown
+        while not shutdown_requested:
+            job = worker.request_job(languages=languages)
+
+            if job:
+                job_id = job["job_id"]
+                sub_logger.info(f"Processing job #{job_id}")
+
+                try:
+                    success = worker._process_job_safe(job)
+                    result_queue.put({"success": success, "job_id": job_id})
+                except torch.cuda.OutOfMemoryError as e:
+                    sub_logger.error(f"OOM on job #{job_id}: {e}")
+                    result_queue.put({"success": False, "job_id": job_id, "oom": True})
+                    # Exit subprocess on OOM - let parent decide whether to respawn
+                    break
+                except Exception as e:
+                    sub_logger.error(f"Error on job #{job_id}: {e}")
+                    result_queue.put({"success": False, "job_id": job_id})
+            else:
+                # No jobs available, wait briefly
+                time.sleep(5)
+
+    except Exception as e:
+        sub_logger.error(f"Subprocess worker failed: {e}", exc_info=True)
+        result_queue.put({"success": False, "error": str(e)})
+
+    sub_logger.info("Subprocess worker exiting")
+
+
