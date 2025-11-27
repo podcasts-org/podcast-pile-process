@@ -298,6 +298,8 @@ def manager(port, host, reload, workers):
 @click.option("--gpu", type=int, help="GPU device ID to use (e.g., 0, 1, 2)")
 @click.option("--all-gpus", is_flag=True, help="Spawn a worker on each available GPU")
 @click.option("--gpus", help='Comma-separated list of GPU IDs to use (e.g., "0,1,3")')
+@click.option("--adaptive", is_flag=True, help="Enable adaptive concurrency mode (auto-scale jobs per GPU)")
+@click.option("--max-concurrency", default=4, type=int, help="Max concurrent jobs per GPU in adaptive mode (default: 4)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option(
     "--s3-endpoint",
@@ -340,6 +342,8 @@ def worker(
     gpu,
     all_gpus,
     gpus,
+    adaptive,
+    max_concurrency,
     verbose,
     s3_endpoint,
     s3_access_key,
@@ -429,6 +433,8 @@ def worker(
                     once,
                     poll_interval,
                     gpu_id,
+                    adaptive,
+                    max_concurrency,
                     verbose,
                     s3_endpoint,
                     s3_access_key,
@@ -439,7 +445,8 @@ def worker(
             )
             p.start()
             processes.append(p)
-            click.echo(f"  ✓ Started worker {wid} (PID: {p.pid})")
+            mode_str = f"adaptive (max {max_concurrency})" if adaptive else "standard"
+            click.echo(f"  ✓ Started worker {wid} (PID: {p.pid}, mode: {mode_str})")
 
         click.echo(
             f"\nAll {len(gpu_list)} workers running. Press Ctrl+C to stop all workers."
@@ -505,6 +512,8 @@ def worker(
             once,
             poll_interval,
             gpu_id,
+            adaptive,
+            max_concurrency,
             verbose,
             s3_endpoint,
             s3_access_key,
@@ -525,6 +534,8 @@ def _run_single_worker(
     once,
     poll_interval,
     gpu_id,
+    adaptive,
+    max_concurrency,
     verbose,
     s3_endpoint,
     s3_access_key,
@@ -547,13 +558,16 @@ def _run_single_worker(
 
     from podcastpile.worker import PodcastPileWorker
 
+    mode_str = "Single job" if once else ("Adaptive" if adaptive else "Continuous")
     click.echo(f"Starting Podcast Pile Worker: {worker_id}")
     click.echo(f"  Manager: {manager}")
     click.echo(f"  Languages: {languages}")
     click.echo(f"  Config: {config}")
     click.echo(f"  Batch size: {batch_size}")
     click.echo(f"  GPU: {gpu_id if gpu_id is not None else 'auto'}")
-    click.echo(f"  Mode: {'Single job' if once else 'Continuous'}")
+    click.echo(f"  Mode: {mode_str}")
+    if adaptive:
+        click.echo(f"  Max concurrent jobs: {max_concurrency}")
     click.echo()
 
     # Create S3 config if credentials are provided
@@ -606,8 +620,16 @@ def _run_single_worker(
                 click.echo("✓ Job processed successfully")
             else:
                 click.echo("No jobs available")
+        elif adaptive:
+            # Adaptive concurrent mode
+            click.echo("Running in ADAPTIVE mode - will auto-scale concurrent jobs")
+            worker_instance.run_loop_adaptive(
+                languages=languages,
+                poll_interval=poll_interval,
+                max_concurrency=max_concurrency
+            )
         else:
-            # Continuous mode
+            # Standard continuous mode
             worker_instance.run_loop(languages=languages, poll_interval=poll_interval)
     except KeyboardInterrupt:
         click.echo("\n\nWorker stopped by user")
