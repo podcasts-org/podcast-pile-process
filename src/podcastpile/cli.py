@@ -298,8 +298,8 @@ def manager(port, host, reload, workers):
 @click.option("--gpu", type=int, help="GPU device ID to use (e.g., 0, 1, 2)")
 @click.option("--all-gpus", is_flag=True, help="Spawn a worker on each available GPU")
 @click.option("--gpus", help='Comma-separated list of GPU IDs to use (e.g., "0,1,3")')
-@click.option("--adaptive", is_flag=True, help="Enable adaptive concurrency mode (auto-scale jobs per GPU)")
-@click.option("--max-concurrency", default=4, type=int, help="Max concurrent jobs per GPU in adaptive mode (default: 4)")
+@click.option("--adaptive", is_flag=True, help="Enable adaptive concurrency - dynamically spawns worker subprocesses based on available VRAM")
+@click.option("--max-concurrency", default=4, type=int, help="Max concurrent worker processes in adaptive mode (default: 4)")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging")
 @click.option(
     "--s3-endpoint",

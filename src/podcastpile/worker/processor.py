@@ -35,7 +35,7 @@ from podcastpile.nisqa import NISQAPredictor
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.4.1"  # Adaptive GPU memory management + Rich stats reporting
+WORKER_VERSION = "0.5.0"  # Subprocess-based adaptive concurrency (safe multi-job per GPU)
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -1623,6 +1623,10 @@ class PodcastPileWorker:
         # Initialize S3 uploader if config provided
         self.s3_uploader = S3Uploader(s3_config) if s3_config else None
 
+        # Lock for GPU operations - NeMo models are NOT thread-safe
+        # This ensures only one job uses GPU at a time
+        self._gpu_lock = threading.Lock()
+
         # Headers for API requests
         self.headers = {}
         if worker_password:
@@ -2014,141 +2018,239 @@ class PodcastPileWorker:
         shared_stats: Optional['SharedWorkerStats'] = None,
     ):
         """
-        Continuously request and process jobs with adaptive concurrency.
+        Continuously request and process jobs with adaptive concurrency using subprocesses.
 
-        This mode intelligently spawns multiple concurrent jobs to maximize GPU
-        utilization while preventing OOM errors. It:
-        - Starts conservative with 1 job
-        - Monitors GPU memory usage continuously
-        - Gradually increases concurrency when memory allows
-        - Backs off immediately when memory gets tight
-        - Handles OOM gracefully by reducing concurrency
-        - Learns memory patterns from completed jobs
+        This mode spawns separate worker PROCESSES (not threads) to run concurrent jobs.
+        Each subprocess loads its own copy of the models, which is required because
+        NeMo/PyTorch models are not thread-safe for concurrent GPU execution.
+
+        The scheduler:
+        - Starts conservative with 1 worker process
+        - Monitors GPU memory and spawns more workers when VRAM allows
+        - Each worker has its own model copy (~X GB VRAM per worker)
+        - Backs off by not spawning new workers when memory is tight
+        - Learns typical memory usage per worker over time
 
         Args:
             languages: Comma-separated language codes (default: "en")
             poll_interval: Seconds to wait between requests if no job available
-            max_concurrency: Maximum concurrent jobs per GPU (default: 4)
+            max_concurrency: Maximum concurrent worker processes (default: 4)
             shared_stats: Optional SharedWorkerStats for cross-process stats reporting
         """
-        logger.info(f"Starting ADAPTIVE worker loop (languages: {languages})...")
-        logger.info(f"Max concurrency: {max_concurrency}")
+        logger.info(f"Starting ADAPTIVE worker loop with SUBPROCESS workers...")
+        logger.info(f"Languages: {languages}, Max workers: {max_concurrency}")
         logger.info("Press Ctrl+C to stop")
 
         gpu_id = self.gpu_id if self.gpu_id is not None else 0
+        memory_monitor = GPUMemoryMonitor(gpu_id)
 
-        # Create scheduler with job processor
-        scheduler = AdaptiveJobScheduler(
-            gpu_id=gpu_id,
-            job_processor=lambda job: self._process_job_safe(job),
-            max_concurrency=max_concurrency
-        )
+        # Get baseline memory (models already loaded in this process)
+        baseline_stats = memory_monitor.get_memory_stats()
+        if baseline_stats:
+            baseline_vram = baseline_stats.used_mb
+            total_vram = baseline_stats.total_mb
+            logger.info(f"Baseline VRAM usage (models loaded): {baseline_vram:.0f}MB / {total_vram:.0f}MB")
+            # Estimate per-worker VRAM (model size)
+            estimated_worker_vram = baseline_vram * 0.9  # Slightly less due to shared CUDA context
+        else:
+            estimated_worker_vram = 8000  # Conservative 8GB default
+            total_vram = 24000
 
-        # Start memory watchdog thread
-        watchdog_thread = threading.Thread(
-            target=scheduler._memory_watchdog,
-            daemon=True
-        )
-        watchdog_thread.start()
+        logger.info(f"Estimated VRAM per worker: ~{estimated_worker_vram:.0f}MB")
 
-        # Track active futures for concurrent jobs
-        active_futures: Dict[int, Future] = {}
-        executor = ThreadPoolExecutor(max_workers=max_concurrency)
+        # Safety buffer - always keep this much free
+        safety_buffer_mb = 2000  # 2GB safety buffer
 
-        # Stats tracking
-        last_stats_update = time.time()
-        stats_update_interval = 5.0  # Update shared stats every 5 seconds
+        # Track active worker processes
+        active_workers: Dict[int, multiprocessing.Process] = {}  # worker_id -> Process
+        worker_counter = 0
+
+        # Shared queue for job results (success/failure counts)
+        result_queue = multiprocessing.Queue()
+
+        # Current target concurrency (starts at 1, adapts based on memory)
+        current_target = 1
+        last_ramp_check = time.time()
+        ramp_check_interval = 30.0  # Check for ramp-up every 30s
+        consecutive_successes = 0
+
+        def get_safe_worker_count() -> int:
+            """Calculate how many workers we can safely run based on VRAM"""
+            stats = memory_monitor.get_memory_stats()
+            if not stats:
+                return 1
+
+            available = stats.free_mb - safety_buffer_mb
+            if available <= 0:
+                return max(1, len(active_workers))  # Don't kill existing workers
+
+            # How many MORE workers could we fit?
+            additional = int(available / estimated_worker_vram)
+            total_possible = len(active_workers) + additional
+
+            return min(total_possible, max_concurrency)
+
+        def spawn_worker(worker_num: int) -> multiprocessing.Process:
+            """Spawn a new worker subprocess"""
+            p = multiprocessing.Process(
+                target=_adaptive_worker_subprocess,
+                args=(
+                    self.manager_url,
+                    f"{self.worker_id}-sub{worker_num}",
+                    self.worker_password,
+                    self.processor.config_name,
+                    self.processor.model_path,
+                    gpu_id,
+                    languages,
+                    self.processor.batch_size,
+                    self.s3_uploader.bucket if self.s3_uploader else None,
+                    result_queue,
+                    shared_stats,
+                ),
+                daemon=True
+            )
+            p.start()
+            logger.info(f"Spawned worker subprocess {worker_num} (PID: {p.pid})")
+            return p
 
         try:
+            # Start with 1 worker
+            # NOTE: We don't spawn here - this process IS the first worker
+            # We'll spawn ADDITIONAL workers as subprocesses
+
+            # This process becomes worker 0 and processes jobs directly
+            logger.info("Main process will handle jobs as worker-0")
+
             while True:
-                # Clean up completed futures
-                completed_job_ids = []
-                completed_count = 0
-                failed_count = 0
-
-                for job_id, future in active_futures.items():
-                    if future.done():
-                        completed_job_ids.append(job_id)
-                        try:
-                            # Get result to surface any exceptions
-                            success = future.result()
-                            if success:
-                                logger.info(f"Job #{job_id} completed successfully")
-                                completed_count += 1
-                            else:
-                                logger.warning(f"Job #{job_id} failed")
-                                failed_count += 1
-                        except Exception as e:
-                            logger.error(f"Job #{job_id} raised exception: {e}")
-                            failed_count += 1
-
-                for job_id in completed_job_ids:
-                    del active_futures[job_id]
-
-                # Update shared stats if available
-                if shared_stats:
-                    if completed_count > 0:
-                        shared_stats.increment_completed(completed_count)
-                    if failed_count > 0:
-                        shared_stats.increment_failed(failed_count)
-
-                    # Periodically update GPU stats
-                    now = time.time()
-                    if now - last_stats_update >= stats_update_interval:
-                        stats = scheduler.get_stats()
-                        shared_stats.update_gpu_stats(gpu_id, stats)
-                        last_stats_update = now
-
-                # Try to start new jobs if we have capacity
-                jobs_to_start = scheduler._current_concurrency - len(active_futures)
-
-                if jobs_to_start > 0 and scheduler.can_accept_job():
-                    # Request a new job
-                    job = self.request_job(languages=languages)
-
-                    if job:
-                        job_id = job["job_id"]
-                        logger.info(
-                            f"Starting job #{job_id} (active: {len(active_futures)+1}/{scheduler._current_concurrency})"
-                        )
-
-                        # Submit job to thread pool
-                        future = executor.submit(
-                            scheduler._process_job_wrapper,
-                            job
-                        )
-                        active_futures[job_id] = future
-                    else:
-                        # No jobs available
-                        if not active_futures:
-                            # No active jobs, wait before polling again
-                            logger.info(f"No jobs available, waiting {poll_interval}s...")
-                            time.sleep(poll_interval)
+                # Check for completed workers and collect results
+                dead_workers = []
+                for wid, proc in active_workers.items():
+                    if not proc.is_alive():
+                        dead_workers.append(wid)
+                        exit_code = proc.exitcode
+                        if exit_code != 0:
+                            logger.warning(f"Worker {wid} died with exit code {exit_code}")
                         else:
-                            # Have active jobs, just check again soon
-                            time.sleep(1.0)
+                            logger.info(f"Worker {wid} exited normally")
+
+                for wid in dead_workers:
+                    del active_workers[wid]
+
+                # Collect results from queue
+                while not result_queue.empty():
+                    try:
+                        result = result_queue.get_nowait()
+                        if result.get("success"):
+                            consecutive_successes += 1
+                            if shared_stats:
+                                shared_stats.increment_completed()
+                        else:
+                            consecutive_successes = 0
+                            if shared_stats:
+                                shared_stats.increment_failed()
+                            if result.get("oom"):
+                                if shared_stats:
+                                    shared_stats.increment_oom()
+                                # OOM - reduce target
+                                current_target = max(1, current_target - 1)
+                                logger.warning(f"OOM detected, reducing target to {current_target}")
+                    except:
+                        break
+
+                # Check if we should adjust concurrency
+                now = time.time()
+                if now - last_ramp_check >= ramp_check_interval:
+                    safe_count = get_safe_worker_count()
+
+                    # Consider ramping up if successful and memory allows
+                    if consecutive_successes >= 3 and safe_count > current_target:
+                        old_target = current_target
+                        current_target = min(current_target + 1, safe_count, max_concurrency)
+                        if current_target > old_target:
+                            logger.info(f"Ramping up: {old_target} -> {current_target} workers (memory allows {safe_count})")
+                            consecutive_successes = 0
+
+                    last_ramp_check = now
+
+                    # Update stats
+                    if shared_stats:
+                        stats = memory_monitor.get_memory_stats()
+                        if stats:
+                            shared_stats.update_gpu_stats(gpu_id, {
+                                "current_concurrency": current_target,
+                                "active_jobs": len(active_workers) + 1,  # +1 for main process
+                                "max_concurrency": max_concurrency,
+                                "memory_used_mb": stats.used_mb,
+                                "memory_total_mb": stats.total_mb,
+                                "memory_utilization_pct": stats.utilization_pct,
+                            })
+
+                # Spawn more workers if needed (current_target - 1 because main process is worker 0)
+                workers_needed = current_target - 1 - len(active_workers)
+                if workers_needed > 0:
+                    # Check memory before spawning
+                    stats = memory_monitor.get_memory_stats()
+                    if stats and stats.free_mb > (estimated_worker_vram + safety_buffer_mb):
+                        worker_counter += 1
+                        proc = spawn_worker(worker_counter)
+                        active_workers[worker_counter] = proc
+                    else:
+                        logger.debug(f"Skipping worker spawn - insufficient memory ({stats.free_mb:.0f}MB free)")
+
+                # Main process handles a job (acts as worker 0)
+                job = self.request_job(languages=languages)
+
+                if job:
+                    job_id = job["job_id"]
+                    logger.info(f"[Main] Processing job #{job_id}")
+                    try:
+                        success = self._process_job_safe(job)
+                        if success:
+                            consecutive_successes += 1
+                            if shared_stats:
+                                shared_stats.increment_completed()
+                        else:
+                            consecutive_successes = 0
+                            if shared_stats:
+                                shared_stats.increment_failed()
+                    except torch.cuda.OutOfMemoryError:
+                        logger.error(f"[Main] OOM on job #{job_id}")
+                        consecutive_successes = 0
+                        current_target = max(1, current_target - 1)
+                        if shared_stats:
+                            shared_stats.increment_failed()
+                            shared_stats.increment_oom()
+                        # Force cleanup
+                        memory_monitor.force_memory_cleanup()
+                        time.sleep(5)
+                    except Exception as e:
+                        logger.error(f"[Main] Error on job #{job_id}: {e}")
+                        consecutive_successes = 0
+                        if shared_stats:
+                            shared_stats.increment_failed()
                 else:
-                    # At capacity or throttled, wait a bit
-                    time.sleep(1.0)
+                    # No jobs available
+                    if not active_workers:
+                        logger.info(f"No jobs available, waiting {poll_interval}s...")
+                        time.sleep(poll_interval)
+                    else:
+                        # Have subprocess workers, they'll pick up jobs
+                        time.sleep(2)
 
         except KeyboardInterrupt:
-            logger.info("\nShutting down adaptive worker...")
-            scheduler._shutdown = True
-
-            # Wait for active jobs to complete
-            if active_futures:
-                logger.info(f"Waiting for {len(active_futures)} active jobs to complete...")
-                for job_id, future in active_futures.items():
-                    try:
-                        future.result(timeout=300)  # 5 minute timeout
-                    except Exception as e:
-                        logger.error(f"Job #{job_id} failed during shutdown: {e}")
-
-            executor.shutdown(wait=True)
-            logger.info("Adaptive worker stopped")
+            logger.info("\nShutting down adaptive workers...")
 
         finally:
-            scheduler._shutdown = True
+            # Terminate all subprocess workers
+            for wid, proc in active_workers.items():
+                if proc.is_alive():
+                    logger.info(f"Terminating worker {wid}...")
+                    proc.terminate()
+                    proc.join(timeout=10)
+                    if proc.is_alive():
+                        proc.kill()
+
+            logger.info("Adaptive worker stopped")
 
     def _process_job_safe(self, job: Dict) -> bool:
         """
@@ -2224,3 +2326,96 @@ class PodcastPileWorker:
             # Cleanup temp directory
             import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _adaptive_worker_subprocess(
+    manager_url: str,
+    worker_id: str,
+    worker_password: Optional[str],
+    config: str,
+    model_path: Optional[str],
+    gpu_id: int,
+    languages: str,
+    batch_size: int,
+    s3_bucket: Optional[str],
+    result_queue: multiprocessing.Queue,
+    shared_stats: Optional['SharedWorkerStats'],
+):
+    """
+    Worker subprocess that loads its own models and processes jobs continuously.
+
+    This function runs in a separate process spawned by run_loop_adaptive.
+    Each subprocess:
+    1. Loads its own copy of the ML models
+    2. Continuously requests and processes jobs
+    3. Reports results back via the result_queue
+    """
+    import signal
+
+    # Setup logging for this subprocess
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f"%(asctime)s - [{worker_id}] - %(levelname)s - %(message)s",
+    )
+    sub_logger = logging.getLogger(__name__)
+
+    sub_logger.info(f"Subprocess worker starting on GPU {gpu_id}...")
+
+    # Handle graceful shutdown
+    shutdown_requested = False
+
+    def handle_signal(sig, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        # Create worker instance (this loads models - takes time and VRAM)
+        worker = PodcastPileWorker(
+            manager_url=manager_url,
+            worker_id=worker_id,
+            worker_password=worker_password,
+            config=config,
+            model_path=model_path,
+            gpu_id=gpu_id,
+            languages=languages,
+            batch_size=batch_size,
+            s3_config=None,  # TODO: Pass S3 config if needed
+        )
+
+        sub_logger.info("Loading models...")
+        worker.load_models()
+        sub_logger.info("Models loaded, starting job loop")
+
+        # Process jobs until shutdown
+        while not shutdown_requested:
+            job = worker.request_job(languages=languages)
+
+            if job:
+                job_id = job["job_id"]
+                sub_logger.info(f"Processing job #{job_id}")
+
+                try:
+                    success = worker._process_job_safe(job)
+                    result_queue.put({"success": success, "job_id": job_id})
+                except torch.cuda.OutOfMemoryError as e:
+                    sub_logger.error(f"OOM on job #{job_id}: {e}")
+                    result_queue.put({"success": False, "job_id": job_id, "oom": True})
+                    # Exit subprocess on OOM - let parent decide whether to respawn
+                    break
+                except Exception as e:
+                    sub_logger.error(f"Error on job #{job_id}: {e}")
+                    result_queue.put({"success": False, "job_id": job_id})
+            else:
+                # No jobs available, wait briefly
+                time.sleep(5)
+
+    except Exception as e:
+        sub_logger.error(f"Subprocess worker failed: {e}", exc_info=True)
+        result_queue.put({"success": False, "error": str(e)})
+
+    sub_logger.info("Subprocess worker exiting")
+
+
