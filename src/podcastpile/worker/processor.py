@@ -1019,10 +1019,9 @@ class AudioProcessor:
         self.diar_model.sortformer_modules._check_streaming_parameters()
         logger.info(f"✓ Using {self.config_name} configuration")
 
-    @staticmethod
-    def load_audio_torchaudio(audio_path: str, target_sr: int = 16000) -> tuple:
+    def load_audio_torchaudio(self, audio_path: str, target_sr: int = 16000) -> tuple:
         """
-        Load audio using torchaudio (GPU-accelerated if available)
+        Load audio using torchaudio (CPU-based for thread safety in concurrent mode)
 
         Args:
             audio_path: Path to audio file
@@ -1038,12 +1037,11 @@ class AudioProcessor:
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        # Resample if needed (GPU-accelerated if CUDA available)
+        # Resample if needed
+        # NOTE: We do resampling on CPU to avoid CUDA race conditions in concurrent mode.
+        # The GPU memory saved by CPU resampling is better used for the actual ML models.
         if sr != target_sr:
             resampler = torchaudio.transforms.Resample(sr, target_sr)
-            if torch.cuda.is_available():
-                waveform = waveform.cuda()
-                resampler = resampler.cuda()
             waveform = resampler(waveform)
             sr = target_sr
 
