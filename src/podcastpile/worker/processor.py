@@ -567,6 +567,7 @@ class SharedWorkerStats:
             "total_completed": 0,
             "total_failed": 0,
             "total_oom_events": 0,
+            "workers_spawned": 0,
             "start_time": time.time(),
         })
 
@@ -692,11 +693,11 @@ def print_global_stats_rich(stats: Dict[str, Any]):
         "Failed", f"[{failed_style}]{stats['total_failed']}[/]"
     )
 
-    # Row 2: Active jobs / throughput
-    active_str = f"{stats['total_active_jobs']}/{stats['total_concurrency']}"
+    # Row 2: Workers / throughput
+    workers_str = f"{stats['total_active_jobs']}/{stats['total_concurrency']}"
     throughput_str = f"{stats['jobs_per_minute']:.2f}/min"
     table.add_row(
-        "Active Jobs", f"[cyan]{active_str}[/]",
+        "Workers", f"[cyan]{workers_str}[/]",
         "Throughput", f"[magenta]{throughput_str}[/]"
     )
 
