@@ -6,6 +6,7 @@ Worker processor for Podcast Pile - diarizes audio and uploads results
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -16,8 +17,9 @@ import gc
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
+from multiprocessing import Manager
 from pathlib import Path
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
 
 import librosa
 import nemo.collections.asr as nemo_asr
@@ -33,7 +35,7 @@ from podcastpile.nisqa import NISQAPredictor
 logger = logging.getLogger(__name__)
 
 # Worker version - increment when making changes to processing logic
-WORKER_VERSION = "0.4.0"  # Adaptive GPU memory management + multi-job concurrency
+WORKER_VERSION = "0.4.1"  # Adaptive GPU memory management + Rich stats reporting
 
 
 def get_gpu_info(gpu_id: Optional[int] = None) -> Optional[str]:
@@ -534,6 +536,295 @@ class AdaptiveJobScheduler:
             "memory_total_mb": stats.total_mb if stats else None,
             "memory_utilization_pct": stats.utilization_pct if stats else None,
         }
+
+
+class SharedWorkerStats:
+    """
+    Shared statistics collector for multi-process workers.
+
+    Uses multiprocessing.Manager to share stats across processes.
+    Each GPU worker updates its own stats, and the main process
+    aggregates them for display.
+    """
+
+    def __init__(self, manager: Optional[Manager] = None):
+        """
+        Initialize shared stats.
+
+        Args:
+            manager: Optional multiprocessing.Manager instance.
+                     If None, creates a new one (use for single-process mode).
+        """
+        self._own_manager = manager is None
+        self._manager = manager or Manager()
+
+        # Shared dict for per-GPU stats
+        # Key: gpu_id, Value: dict of stats
+        self._gpu_stats = self._manager.dict()
+
+        # Global counters (shared across all processes)
+        self._global = self._manager.dict({
+            "total_completed": 0,
+            "total_failed": 0,
+            "total_oom_events": 0,
+            "start_time": time.time(),
+        })
+
+        # Lock for atomic updates
+        self._lock = self._manager.Lock()
+
+    def update_gpu_stats(self, gpu_id: int, stats: Dict[str, Any]):
+        """Update stats for a specific GPU"""
+        with self._lock:
+            self._gpu_stats[gpu_id] = {
+                **stats,
+                "last_update": time.time(),
+            }
+
+    def increment_completed(self, count: int = 1):
+        """Increment global completed counter"""
+        with self._lock:
+            self._global["total_completed"] = self._global.get("total_completed", 0) + count
+
+    def increment_failed(self, count: int = 1):
+        """Increment global failed counter"""
+        with self._lock:
+            self._global["total_failed"] = self._global.get("total_failed", 0) + count
+
+    def increment_oom(self, count: int = 1):
+        """Increment global OOM counter"""
+        with self._lock:
+            self._global["total_oom_events"] = self._global.get("total_oom_events", 0) + count
+
+    def get_all_stats(self) -> Dict[str, Any]:
+        """Get aggregated stats from all GPUs"""
+        with self._lock:
+            gpu_stats = dict(self._gpu_stats)
+            global_stats = dict(self._global)
+
+        # Calculate aggregates
+        total_active = sum(s.get("active_jobs", 0) for s in gpu_stats.values())
+        total_concurrency = sum(s.get("current_concurrency", 0) for s in gpu_stats.values())
+        max_concurrency = sum(s.get("max_concurrency", 0) for s in gpu_stats.values())
+
+        # Memory stats
+        total_memory_used = sum(s.get("memory_used_mb", 0) or 0 for s in gpu_stats.values())
+        total_memory_total = sum(s.get("memory_total_mb", 0) or 0 for s in gpu_stats.values())
+        avg_memory_pct = (
+            (total_memory_used / total_memory_total * 100)
+            if total_memory_total > 0 else 0
+        )
+
+        # Uptime
+        uptime_seconds = time.time() - global_stats.get("start_time", time.time())
+
+        # Throughput
+        total_completed = global_stats.get("total_completed", 0)
+        jobs_per_minute = (total_completed / uptime_seconds * 60) if uptime_seconds > 0 else 0
+
+        return {
+            "gpu_count": len(gpu_stats),
+            "gpu_stats": gpu_stats,
+            "total_active_jobs": total_active,
+            "total_concurrency": total_concurrency,
+            "max_concurrency": max_concurrency,
+            "total_completed": total_completed,
+            "total_failed": global_stats.get("total_failed", 0),
+            "total_oom_events": global_stats.get("total_oom_events", 0),
+            "total_memory_used_mb": total_memory_used,
+            "total_memory_total_mb": total_memory_total,
+            "avg_memory_utilization_pct": avg_memory_pct,
+            "uptime_seconds": uptime_seconds,
+            "jobs_per_minute": jobs_per_minute,
+        }
+
+    def cleanup(self):
+        """Cleanup manager if we own it"""
+        if self._own_manager and self._manager:
+            try:
+                self._manager.shutdown()
+            except:
+                pass
+
+
+def print_global_stats_rich(stats: Dict[str, Any]):
+    """
+    Print global stats using Rich for colorful output.
+
+    This is called from the main process to display aggregated stats.
+    """
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.panel import Panel
+        from rich.text import Text
+        from rich import box
+    except ImportError:
+        # Fallback to plain text if Rich not available
+        logger.info(
+            f"Stats: {stats['total_completed']} completed, "
+            f"{stats['total_failed']} failed, "
+            f"{stats['total_active_jobs']}/{stats['total_concurrency']} active, "
+            f"{stats['jobs_per_minute']:.1f} jobs/min"
+        )
+        return
+
+    console = Console()
+
+    # Format uptime
+    uptime = stats["uptime_seconds"]
+    hours, remainder = divmod(int(uptime), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    # Create main stats table
+    table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
+    table.add_column("Label", style="dim")
+    table.add_column("Value", justify="right")
+    table.add_column("Label2", style="dim")
+    table.add_column("Value2", justify="right")
+
+    # Row 1: Jobs completed / failed
+    completed_style = "bold green" if stats["total_completed"] > 0 else "white"
+    failed_style = "bold red" if stats["total_failed"] > 0 else "dim"
+    table.add_row(
+        "Completed", f"[{completed_style}]{stats['total_completed']}[/]",
+        "Failed", f"[{failed_style}]{stats['total_failed']}[/]"
+    )
+
+    # Row 2: Active jobs / throughput
+    active_str = f"{stats['total_active_jobs']}/{stats['total_concurrency']}"
+    throughput_str = f"{stats['jobs_per_minute']:.2f}/min"
+    table.add_row(
+        "Active Jobs", f"[cyan]{active_str}[/]",
+        "Throughput", f"[magenta]{throughput_str}[/]"
+    )
+
+    # Row 3: Memory / OOMs
+    mem_pct = stats["avg_memory_utilization_pct"]
+    if mem_pct > 90:
+        mem_style = "bold red"
+    elif mem_pct > 75:
+        mem_style = "yellow"
+    else:
+        mem_style = "green"
+    mem_str = f"{stats['total_memory_used_mb']:.0f}/{stats['total_memory_total_mb']:.0f}MB ({mem_pct:.1f}%)"
+
+    oom_style = "bold red" if stats["total_oom_events"] > 0 else "dim green"
+    table.add_row(
+        "GPU Memory", f"[{mem_style}]{mem_str}[/]",
+        "OOM Events", f"[{oom_style}]{stats['total_oom_events']}[/]"
+    )
+
+    # Row 4: GPUs / Uptime
+    table.add_row(
+        "GPUs", f"[blue]{stats['gpu_count']}[/]",
+        "Uptime", f"[dim]{uptime_str}[/]"
+    )
+
+    # Per-GPU details (if multiple GPUs)
+    gpu_details = []
+    for gpu_id, gpu_stat in sorted(stats.get("gpu_stats", {}).items()):
+        mem_pct = gpu_stat.get("memory_utilization_pct", 0) or 0
+        if mem_pct > 90:
+            mem_color = "red"
+        elif mem_pct > 75:
+            mem_color = "yellow"
+        else:
+            mem_color = "green"
+
+        active = gpu_stat.get("active_jobs", 0)
+        concurrency = gpu_stat.get("current_concurrency", 1)
+        completed = gpu_stat.get("jobs_completed", 0)
+
+        gpu_details.append(
+            f"[bold]GPU {gpu_id}[/]: [{mem_color}]{mem_pct:.0f}%[/] mem, "
+            f"[cyan]{active}/{concurrency}[/] active, "
+            f"[green]{completed}[/] done"
+        )
+
+    # Build the panel content
+    if gpu_details:
+        gpu_text = " │ ".join(gpu_details)
+        panel_content = f"{table.render(console)}\n[dim]─[/] {gpu_text}"
+    else:
+        panel_content = table
+
+    # Print panel
+    panel = Panel(
+        table,
+        title="[bold blue]📊 Worker Stats[/]",
+        subtitle=f"[dim]{gpu_details[0] if len(gpu_details) == 1 else ' │ '.join(gpu_details) if gpu_details else ''}[/]",
+        border_style="blue",
+        padding=(0, 1),
+    )
+
+    console.print(panel)
+
+
+class GlobalStatsReporter:
+    """
+    Background thread/process that periodically prints global stats using Rich.
+    """
+
+    def __init__(
+        self,
+        shared_stats: SharedWorkerStats,
+        interval: float = 30.0,
+    ):
+        """
+        Initialize the stats reporter.
+
+        Args:
+            shared_stats: SharedWorkerStats instance to read from
+            interval: How often to print stats (seconds)
+        """
+        self.shared_stats = shared_stats
+        self.interval = interval
+        self._shutdown = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        """Start the reporter thread"""
+        self._shutdown = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info(f"Global stats reporter started (interval: {self.interval}s)")
+
+    def stop(self):
+        """Stop the reporter thread"""
+        self._shutdown = True
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self):
+        """Reporter loop"""
+        # Wait a bit before first report to let workers start
+        time.sleep(min(10, self.interval))
+
+        while not self._shutdown:
+            try:
+                stats = self.shared_stats.get_all_stats()
+                print_global_stats_rich(stats)
+            except Exception as e:
+                logger.error(f"Error printing stats: {e}")
+
+            # Sleep in small increments to check for shutdown
+            for _ in range(int(self.interval)):
+                if self._shutdown:
+                    break
+                time.sleep(1)
+
+    def print_final_stats(self):
+        """Print final stats on shutdown"""
+        try:
+            from rich.console import Console
+            console = Console()
+            console.print("\n[bold yellow]═══ Final Stats ═══[/]")
+            stats = self.shared_stats.get_all_stats()
+            print_global_stats_rich(stats)
+        except Exception as e:
+            logger.error(f"Error printing final stats: {e}")
 
 
 class AudioProcessor:
@@ -1723,7 +2014,8 @@ class PodcastPileWorker:
         self,
         languages: str = "en",
         poll_interval: int = 10,
-        max_concurrency: int = 4
+        max_concurrency: int = 4,
+        shared_stats: Optional['SharedWorkerStats'] = None,
     ):
         """
         Continuously request and process jobs with adaptive concurrency.
@@ -1741,14 +2033,17 @@ class PodcastPileWorker:
             languages: Comma-separated language codes (default: "en")
             poll_interval: Seconds to wait between requests if no job available
             max_concurrency: Maximum concurrent jobs per GPU (default: 4)
+            shared_stats: Optional SharedWorkerStats for cross-process stats reporting
         """
         logger.info(f"Starting ADAPTIVE worker loop (languages: {languages})...")
         logger.info(f"Max concurrency: {max_concurrency}")
         logger.info("Press Ctrl+C to stop")
 
+        gpu_id = self.gpu_id if self.gpu_id is not None else 0
+
         # Create scheduler with job processor
         scheduler = AdaptiveJobScheduler(
-            gpu_id=self.gpu_id if self.gpu_id is not None else 0,
+            gpu_id=gpu_id,
             job_processor=lambda job: self._process_job_safe(job),
             max_concurrency=max_concurrency
         )
@@ -1765,13 +2060,16 @@ class PodcastPileWorker:
         executor = ThreadPoolExecutor(max_workers=max_concurrency)
 
         # Stats tracking
-        last_stats_log = time.time()
-        stats_interval = 60.0  # Log stats every 60 seconds
+        last_stats_update = time.time()
+        stats_update_interval = 5.0  # Update shared stats every 5 seconds
 
         try:
             while True:
                 # Clean up completed futures
                 completed_job_ids = []
+                completed_count = 0
+                failed_count = 0
+
                 for job_id, future in active_futures.items():
                     if future.done():
                         completed_job_ids.append(job_id)
@@ -1780,25 +2078,30 @@ class PodcastPileWorker:
                             success = future.result()
                             if success:
                                 logger.info(f"Job #{job_id} completed successfully")
+                                completed_count += 1
                             else:
                                 logger.warning(f"Job #{job_id} failed")
+                                failed_count += 1
                         except Exception as e:
                             logger.error(f"Job #{job_id} raised exception: {e}")
+                            failed_count += 1
 
                 for job_id in completed_job_ids:
                     del active_futures[job_id]
 
-                # Log stats periodically
-                now = time.time()
-                if now - last_stats_log >= stats_interval:
-                    stats = scheduler.get_stats()
-                    logger.info(
-                        f"Scheduler stats: concurrency={stats['current_concurrency']}, "
-                        f"active={stats['active_jobs']}, completed={stats['jobs_completed']}, "
-                        f"failed={stats['jobs_failed']}, OOMs={stats['oom_events']}, "
-                        f"memory={stats['memory_utilization_pct']:.1f}%"
-                    )
-                    last_stats_log = now
+                # Update shared stats if available
+                if shared_stats:
+                    if completed_count > 0:
+                        shared_stats.increment_completed(completed_count)
+                    if failed_count > 0:
+                        shared_stats.increment_failed(failed_count)
+
+                    # Periodically update GPU stats
+                    now = time.time()
+                    if now - last_stats_update >= stats_update_interval:
+                        stats = scheduler.get_stats()
+                        shared_stats.update_gpu_stats(gpu_id, stats)
+                        last_stats_update = now
 
                 # Try to start new jobs if we have capacity
                 jobs_to_start = scheduler._current_concurrency - len(active_futures)

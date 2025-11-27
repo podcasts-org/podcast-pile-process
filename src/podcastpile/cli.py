@@ -398,8 +398,18 @@ def worker(
         import multiprocessing
         import signal
         import sys
+        from multiprocessing import Manager as MPManager
 
         click.echo(f"\nSpawning {len(gpu_list)} workers...")
+
+        # Create shared stats manager for cross-process stats
+        mp_manager = MPManager()
+
+        # Import shared stats class
+        from podcastpile.worker import SharedWorkerStats, GlobalStatsReporter
+
+        shared_stats = SharedWorkerStats(manager=mp_manager)
+        stats_reporter = GlobalStatsReporter(shared_stats, interval=30.0)
 
         processes = []
         base_worker_id = worker_id or socket.gethostname()
@@ -441,6 +451,7 @@ def worker(
                     s3_secret_key,
                     s3_bucket,
                     s3_region,
+                    shared_stats,  # Pass shared stats to worker
                 ),
             )
             p.start()
@@ -451,6 +462,9 @@ def worker(
         click.echo(
             f"\nAll {len(gpu_list)} workers running. Press Ctrl+C to stop all workers."
         )
+
+        # Start the global stats reporter
+        stats_reporter.start()
 
         # Wait for processes or shutdown signal
         try:
@@ -473,6 +487,10 @@ def worker(
             click.echo("\n\nShutdown requested. Terminating workers...")
             click.echo("Note: Jobs in progress will remain in 'processing' state for manager cleanup")
 
+            # Stop stats reporter and print final stats
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
+
             # Send terminate signal to all workers
             for p in processes:
                 if p.is_alive():
@@ -489,7 +507,12 @@ def worker(
             click.echo("All workers stopped")
         else:
             # Workers died unexpectedly, just inform the user
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
             click.echo("One or more workers stopped unexpectedly. Check logs for details.")
+
+        # Cleanup
+        shared_stats.cleanup()
 
     else:
         # Single worker mode
@@ -500,6 +523,11 @@ def worker(
                 if gpu_id is not None
                 else socket.gethostname()
             )
+
+        # For single worker, create local shared stats for reporting
+        from podcastpile.worker import SharedWorkerStats, GlobalStatsReporter
+        shared_stats = SharedWorkerStats()
+        stats_reporter = GlobalStatsReporter(shared_stats, interval=30.0)
 
         _run_single_worker(
             manager,
@@ -520,6 +548,8 @@ def worker(
             s3_secret_key,
             s3_bucket,
             s3_region,
+            shared_stats,
+            stats_reporter,
         )
 
 
@@ -542,6 +572,8 @@ def _run_single_worker(
     s3_secret_key,
     s3_bucket,
     s3_region,
+    shared_stats=None,
+    stats_reporter=None,
 ):
     """Run a single worker instance"""
     import logging
@@ -611,6 +643,12 @@ def _run_single_worker(
         click.echo(f"Error loading models: {e}", err=True)
         raise click.Abort()
 
+    # Start stats reporter if we have one and it's a single-worker scenario
+    # (for multi-worker, the main process handles reporting)
+    own_reporter = stats_reporter is not None
+    if own_reporter and not once:
+        stats_reporter.start()
+
     # Run worker
     try:
         if once:
@@ -626,7 +664,8 @@ def _run_single_worker(
             worker_instance.run_loop_adaptive(
                 languages=languages,
                 poll_interval=poll_interval,
-                max_concurrency=max_concurrency
+                max_concurrency=max_concurrency,
+                shared_stats=shared_stats,
             )
         else:
             # Standard continuous mode
@@ -637,6 +676,13 @@ def _run_single_worker(
         click.echo(f"Error running worker: {e}", err=True)
         logger.exception("Worker error")
         raise click.Abort()
+    finally:
+        # Stop stats reporter and print final stats
+        if own_reporter and stats_reporter:
+            stats_reporter.stop()
+            stats_reporter.print_final_stats()
+            if shared_stats:
+                shared_stats.cleanup()
 
 
 @cli.command()

@@ -7,6 +7,9 @@ from .processor import (
     GPUMemoryMonitor,
     GPUMemoryStats,
     AdaptiveJobScheduler,
+    SharedWorkerStats,
+    GlobalStatsReporter,
+    print_global_stats_rich,
 )
 
 __all__ = [
@@ -16,4 +19,7 @@ __all__ = [
     "GPUMemoryMonitor",
     "GPUMemoryStats",
     "AdaptiveJobScheduler",
+    "SharedWorkerStats",
+    "GlobalStatsReporter",
+    "print_global_stats_rich",
 ]

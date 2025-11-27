@@ -9,3 +9,5 @@ httpx
 python-dateutil
 click
 boto3
+nvidia-ml-py
+rich
